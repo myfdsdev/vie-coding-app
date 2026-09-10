@@ -12,6 +12,22 @@
       "runtimeExecutable": "npx",
       "runtimeArgs": ["cross-env", "PROVIDER=mock", "PREVIEW_DOMAIN=localhost", "tsx", "server.ts"],
       "port": 3000
+    },
+    {
+      "name": "forge-verify",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "cross-env",
+        "PROVIDER=mock",
+        "PREVIEW_DOMAIN=localhost",
+        "PORT=3001",
+        "FORGE_NEXT_DIST_DIR=.next-verify",
+        "FORGE_DATA_DIR=workspaces/_verify",
+        "FORGE_WORKSPACES_DIR=workspaces/_verify",
+        "tsx",
+        "server.ts"
+      ],
+      "port": 3001
     }
   ]
 }

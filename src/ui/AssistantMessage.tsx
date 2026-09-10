@@ -102,6 +102,7 @@ export function AssistantMessage({ turn }: { turn: AssistantTurn }) {
           )}
           {turn.durationMs !== undefined && <span>{(turn.durationMs / 1000).toFixed(1)}s</span>}
           {turn.model && <span>{turn.model}</span>}
+          {turn.version && <span className="text-ok">saved as v{turn.version.number}</span>}
         </div>
       )}
     </div>
