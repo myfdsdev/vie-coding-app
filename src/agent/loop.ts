@@ -58,6 +58,11 @@ export async function runTurn({ projectId, message, emit, signal }: TurnInput): 
     // the user should never wait for a cold start after the code is written.
     const sandboxPromise = ensureSandbox(projectId);
     sandboxPromise.catch(() => undefined); // observed below; avoid an unhandled rejection meanwhile
+    // Whether a dev server was already serving before this turn, so the open
+    // preview is live over HMR. Checked now: a sandbox (re)created during the
+    // turn is usually serving by the time files are written, yet no preview is
+    // attached to it.
+    const servingBefore = sandboxPromise.then((s) => s.status()).then((st) => st === 'ready', () => false);
 
     // 2 CONTEXT — cache-stable: system prompt, files sorted by path, history, message
     emit({ type: 'stage', stage: 'context' });
@@ -107,17 +112,22 @@ export async function runTurn({ projectId, message, emit, signal }: TurnInput): 
 
     // 8 EXECUTE — push the change into the sandbox and wait for the dev server
     emit({ type: 'stage', stage: 'execute' });
-    emit({ type: 'sandbox', status: 'starting', detail: 'Starting the sandbox' });
     const sandbox = await sandboxPromise;
-    const wasServing = (await sandbox.status()) === 'ready';
+    const wasServing = await servingBefore;
+    // The preview pane unmounts the iframe while the sandbox is not ready, so
+    // announcing a start for a server that is already serving would reload the
+    // preview mid-write — the same race needsPreviewRemount() avoids.
+    if (!wasServing) emit({ type: 'sandbox', status: 'starting', detail: 'Starting the sandbox' });
     await syncToSandbox(sandbox, applied, emit);
     const status = await waitForReady(sandbox, 90_000);
+    // 'ready' can mount the iframe for the first time (e.g. after a failed
+    // warm-up) and a remount may follow it. Neither may load before Vite's
+    // polling watcher has invalidated the files just written, or the page gets
+    // their previous version from Vite's cache.
+    if (status === 'ready' && applied.touched.length) await new Promise((r) => setTimeout(r, WATCHER_SETTLE_MS));
     emit({ type: 'sandbox', status, previewUrl: sandbox.previewUrl(), detail: status === 'ready' ? 'Preview ready' : `Sandbox ${status}` });
     if (status !== 'ready') throw new Error(`The sandbox did not become ready (${status}).`);
     if (needsPreviewRemount({ filesChanged: applied.touched.length > 0, wasServing, dependenciesChanged: applied.dependenciesChanged })) {
-      // Let Vite's polling watcher invalidate the modules just written, or the
-      // remounted page can load their previous version from its cache.
-      await new Promise((r) => setTimeout(r, WATCHER_SETTLE_MS));
       emit({ type: 'preview-reload' });
     }
 

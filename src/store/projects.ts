@@ -9,7 +9,8 @@ import path from 'node:path';
  * M0 has no database: a project is just workspaces/<id>/.
  */
 
-export const WORKSPACES_DIR = path.join(process.cwd(), 'workspaces');
+// FORGE_WORKSPACES_DIR lets tests (or a deployment) keep projects elsewhere.
+export const WORKSPACES_DIR = process.env.FORGE_WORKSPACES_DIR || path.join(process.cwd(), 'workspaces');
 export const TEMPLATE_DIR = path.join(process.cwd(), 'docker', 'template');
 
 /** Lowercase alphanumeric only — it becomes part of the preview hostname sbx-<id>. */
