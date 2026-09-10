@@ -2,19 +2,19 @@ import type { ModelRequest } from './providers';
 
 /**
  * Canned model output for PROVIDER=mock. It exercises the real pipeline —
- * streaming parse, file writes, sandbox sync, preview — with no API key.
+ * streaming parse, file writes, edits, checkpoints, sandbox sync, preview —
+ * with no API key.
  *
  * The first build request in a project always produces the same small task
- * app (titled from the user's words). After that the mock says plainly that
- * it cannot make arbitrary edits, instead of pretending to.
+ * app (titled from the user's words). A follow-up request gets one demo
+ * change, sent as an <edit>: the header badge swaps colour. If the loop
+ * reports that an edit could not be placed, the mock sends the whole file.
  */
 export function mockResponse(req: ModelRequest): string {
   const last = req.messages[req.messages.length - 1]?.content ?? '';
   if (req.context.includes('src/hooks/useTasks.ts')) {
-    return (
-      "I'm the offline mock model, so I can only build the starter task app — I can't make custom edits. " +
-      'Add an ANTHROPIC_API_KEY or GEMINI_API_KEY to .env.local and restart to use a real model.'
-    );
+    const color: Badge = req.context.includes(`rounded-xl ${BADGE.rose}`) ? 'indigo' : 'rose';
+    return /could not be placed exactly/.test(last) ? headerRewrite(color) : headerEdit(color);
   }
   return taskApp(titleFrom(last), last);
 }
@@ -36,6 +36,71 @@ const STOP_WORDS = new Set(
     ' ',
   ),
 );
+
+const BADGE = { indigo: 'bg-indigo-600', rose: 'bg-rose-500' } as const;
+type Badge = keyof typeof BADGE;
+
+function badgeLine(color: Badge): string {
+  return `      <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl ${BADGE[color]} text-white shadow-sm">`;
+}
+
+function headerFile(color: Badge): string {
+  return `import { ListChecks } from 'lucide-react';
+
+interface HeaderProps {
+  title: string;
+  brief: string;
+  remaining: number;
+}
+
+export function Header({ title, brief, remaining }: HeaderProps) {
+  return (
+    <header className="flex items-start gap-4">
+${badgeLine(color)}
+        <ListChecks size={22} />
+      </span>
+      <div className="min-w-0">
+        <h1 className="text-2xl font-semibold tracking-tight text-slate-900">{title}</h1>
+        <p className="mt-1 text-sm text-slate-500">{brief}</p>
+        <p className="mt-2 text-xs font-medium uppercase tracking-wide text-indigo-600">
+          {remaining === 0 ? 'All done' : \`\${remaining} left to do\`}
+        </p>
+      </div>
+    </header>
+  );
+}`;
+}
+
+function headerEdit(color: Badge): string {
+  return `I'm the offline mock model, so a follow-up request gets one demo change: the header badge turns ${color}.
+
+<changes>
+<edit path="src/components/Header.tsx" instruction="I change the header badge colour to ${color}.">
+// ... existing code ...
+export function Header({ title, brief, remaining }: HeaderProps) {
+  return (
+    <header className="flex items-start gap-4">
+${badgeLine(color)}
+        <ListChecks size={22} />
+      </span>
+// ... existing code ...
+</edit>
+</changes>
+
+The header badge is ${color} now. Add an ANTHROPIC_API_KEY or GEMINI_API_KEY to .env.local for real changes.`;
+}
+
+function headerRewrite(color: Badge): string {
+  return `Here is the whole header file instead.
+
+<changes>
+<write path="src/components/Header.tsx">
+${headerFile(color)}
+</write>
+</changes>
+
+The header badge is ${color} now.`;
+}
 
 function taskApp(title: string, brief: string): string {
   // "<" is escaped so user text can never form a tag (e.g. "</write>") inside the stream.
@@ -104,30 +169,7 @@ export function useTasks() {
 </write>
 
 <write path="src/components/Header.tsx">
-import { ListChecks } from 'lucide-react';
-
-interface HeaderProps {
-  title: string;
-  brief: string;
-  remaining: number;
-}
-
-export function Header({ title, brief, remaining }: HeaderProps) {
-  return (
-    <header className="flex items-start gap-4">
-      <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-indigo-600 text-white shadow-sm">
-        <ListChecks size={22} />
-      </span>
-      <div className="min-w-0">
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-900">{title}</h1>
-        <p className="mt-1 text-sm text-slate-500">{brief}</p>
-        <p className="mt-2 text-xs font-medium uppercase tracking-wide text-indigo-600">
-          {remaining === 0 ? 'All done' : \`\${remaining} left to do\`}
-        </p>
-      </div>
-    </header>
-  );
-}
+${headerFile('indigo')}
 </write>
 
 <write path="src/components/TaskInput.tsx">
