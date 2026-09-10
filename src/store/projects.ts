@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { db } from './db';
 
 /**
  * Project file store. The workspace folder on the host is the source of truth
