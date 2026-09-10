@@ -44,11 +44,12 @@ beforeAll(async () => {
 
 afterAll(async () => {
   vi.doUnmock('./providers');
+  (await import('../store/db')).closeDb();
   for (const [key, value] of Object.entries(saved)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  await fs.rm(tmp, { recursive: true, force: true });
+  await fs.rm(tmp, { recursive: true, force: true, maxRetries: 3 });
 });
 
 describe('runTurn with changes that cannot be applied', () => {

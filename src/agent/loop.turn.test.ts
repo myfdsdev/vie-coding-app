@@ -65,6 +65,8 @@ describe('runTurn preview handling', () => {
     // 'starting' would make the pane unmount the live iframe; HMR delivers the change instead.
     expect(sandboxStatuses(events)).toEqual(['ready']);
     expect(events.some(({ e }) => e.type === 'preview-reload')).toBe(false);
+    // One saved version per turn, on top of the starter template (v1).
+    expect(events.find(({ e }) => e.type === 'checkpoint')?.e).toMatchObject({ type: 'checkpoint', version: 2 });
   }, 15_000);
 
   it('remounts, after the watcher settles, when the sandbox came up during the turn', async () => {
