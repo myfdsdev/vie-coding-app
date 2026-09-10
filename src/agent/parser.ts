@@ -190,7 +190,7 @@ export class ChangesParser {
     switch (name) {
       case 'write':
       case 'edit': {
-        const path = (attrs.path ?? '').trim();
+        const path = pathAttr(attrs);
         this.state = { name: 'body', kind: name, path, instruction: attrs.instruction ?? '', content: '' };
         if (path) out.push({ type: 'file-start', kind: name, path });
         return;
@@ -202,12 +202,25 @@ export class ChangesParser {
         if (attrs.from && attrs.to) out.push({ type: 'op', op: { type: 'rename', from: attrs.from.trim(), to: attrs.to.trim() } });
         else out.push({ type: 'warning', message: `<rename> needs from and to: ${tag}` });
         return;
-      case 'delete':
-        if (attrs.path) out.push({ type: 'op', op: { type: 'delete', path: attrs.path.trim() } });
+      case 'delete': {
+        const path = pathAttr(attrs);
+        if (path) out.push({ type: 'op', op: { type: 'delete', path } });
         else out.push({ type: 'warning', message: `<delete> needs a path: ${tag}` });
         return;
+      }
       default:
         out.push({ type: 'warning', message: `Unknown tag inside <changes> ignored: ${tag.slice(0, 60)}` });
     }
   }
+}
+
+/**
+ * Models sometimes name the path attribute differently (Gemini 3.1 Pro wrote
+ * <write file="...">). Accept the common variants rather than drop the file.
+ */
+const PATH_ATTRS = new Set(['path', 'file', 'filepath', 'file_path', 'filename']);
+
+function pathAttr(attrs: Record<string, string>): string {
+  const key = Object.keys(attrs).find((k) => PATH_ATTRS.has(k.toLowerCase()));
+  return key ? attrs[key].trim() : '';
 }
