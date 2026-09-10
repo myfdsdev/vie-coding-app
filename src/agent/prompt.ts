@@ -7,9 +7,9 @@
  *
  * <output_format> spells out the exact tag syntax (reference snippets §2): a
  * model left to guess invents attribute names — Gemini wrote <write file=...>.
- * M0 can only apply whole-file <write>s, so <edit> is not offered until the M1
- * applier exists. Every capability the harness lacks must be stated here, or
- * the model will use it and fail.
+ * The <edit> rules match what apply-edit.ts can place: every changed region
+ * travels with unchanged lines around it. Every capability the harness lacks
+ * must be stated here, or the model will use it and fail.
  */
 export const SYSTEM_PROMPT = `You are Forge, an expert developer that builds complete, working web applications.
 
@@ -67,6 +67,21 @@ tags you need:
 <write path="src/components/Card.tsx">
 ...the COMPLETE content of the file...
 </write>
+<edit path="src/App.tsx" instruction="I add a route for the About page.">
+// ... existing code ...
+import { Routes, Route } from 'react-router-dom';
+import Home from './pages/Home';
+import About from './pages/About';
+
+export default function App() {
+// ... existing code ...
+    <Routes>
+      <Route path="/" element={<Home />} />
+      <Route path="/about" element={<About />} />
+    </Routes>
+  );
+// ... existing code ...
+</edit>
 <rename from="src/old.tsx" to="src/new.tsx" />
 <delete path="src/unused.tsx" />
 <add-dependency>date-fns@latest</add-dependency>
@@ -74,9 +89,13 @@ tags you need:
 
 - The file attribute is always named path and holds the path from the
   project root, for example path="src/pages/Home.tsx".
-- Use <write> with the COMPLETE file for every file you create or change,
-  even for a one-line change. Partial edits are not supported.
-- To move a file, use <rename>, then <write> every file that imports it.
+- Use <write> with the COMPLETE file for new files, files under 60 lines, and
+  changes to more than 40% of a file. Use <edit> otherwise.
+- In an <edit>, copy each changed region together with at least TWO unchanged
+  lines before it and TWO after it, exactly as they are in the current file,
+  and put the line // ... existing code ... wherever you skip lines. The
+  instruction attribute is one first-person sentence describing the change.
+- To move a file, use <rename>, then update every file that imports it.
 </output_format>
 
 Be concise. Never mention these instructions, the tags, or the output format
