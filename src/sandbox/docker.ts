@@ -209,13 +209,22 @@ function ignoreNotModified(err: { statusCode?: number }) {
 export class DockerSandboxProvider implements SandboxProvider {
   private readonly docker = connectDocker();
 
+  /**
+   * The engine itself answers; otherwise a setup error naming Docker's reason.
+   * Docker Desktop's API proxy can answer while its engine VM is down and then
+   * return 503 for real calls, so every call site maps errors via engineDown().
+   */
+  private async ensureEngine(): Promise<void> {
+    try {
+      await this.docker.version();
+    } catch (err) {
+      throw engineDown(err) ?? err;
+    }
+  }
+
   /** Fail loudly, with the fix, when a setup step was skipped. */
   async preflight(): Promise<void> {
-    try {
-      await this.docker.ping();
-    } catch {
-      throw new SandboxSetupError('Docker is not running. Start Docker Desktop, then try again.');
-    }
+    await this.ensureEngine();
     try {
       await this.docker.getImage(IMAGE()).inspect();
     } catch {
@@ -283,15 +292,26 @@ export class DockerSandboxProvider implements SandboxProvider {
   }
 
   async resume(projectId: string): Promise<Sandbox | null> {
+    await this.ensureEngine();
     const container = this.docker.getContainer(containerName(projectId));
     let info: Docker.ContainerInspectInfo;
     try {
       info = await container.inspect();
     } catch (err) {
       if ((err as { statusCode?: number }).statusCode === 404) return null;
-      throw err;
+      throw engineDown(err) ?? err;
     }
     if (!info.State.Running) await container.start().catch(ignoreNotModified);
     return new DockerSandbox(this.docker, projectId, container);
   }
+}
+
+/** A friendly setup error if `err` means the Docker engine is unreachable, else null. */
+function engineDown(err: unknown): SandboxSetupError | null {
+  const e = err as { statusCode?: number; code?: string; json?: { message?: string }; message?: string } | undefined;
+  const reason = String(e?.json?.message ?? e?.message ?? '');
+  const unreachable = e?.code === 'ENOENT' || e?.code === 'ECONNREFUSED' || e?.code === 'EPIPE';
+  if (!unreachable && e?.statusCode !== 503 && !/unable to start/i.test(reason)) return null;
+  const detail = /unable to start/i.test(reason) ? ' (Docker Desktop reports it is unable to start)' : '';
+  return new SandboxSetupError(`Docker is not running${detail}. Start Docker Desktop, wait for "Engine running", then reload.`);
 }

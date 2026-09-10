@@ -75,15 +75,38 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
+// Concurrent callers (page warm-up, React StrictMode's double effect, the first
+// chat turn) must share one copy: two fs.cp runs into the same folder collide
+// on Windows with EBUSY. Kept on globalThis so every module copy shares it.
+const g = globalThis as typeof globalThis & { __forgeWorkspaceInit?: Map<string, Promise<{ created: boolean }>> };
+const workspaceInit = (g.__forgeWorkspaceInit ??= new Map());
+
 /** Create workspaces/<id> from the starter template if it does not exist yet. */
-export async function ensureWorkspace(projectId: string): Promise<{ created: boolean }> {
+export function ensureWorkspace(projectId: string): Promise<{ created: boolean }> {
+  const inflight = workspaceInit.get(projectId);
+  if (inflight) return inflight;
+  const task = createWorkspace(projectId).finally(() => workspaceInit.delete(projectId));
+  workspaceInit.set(projectId, task);
+  return task;
+}
+
+async function createWorkspace(projectId: string): Promise<{ created: boolean }> {
   const dir = workspaceDir(projectId);
   if (await exists(path.join(dir, 'package.json'))) return { created: false };
-  await fs.mkdir(dir, { recursive: true });
-  await fs.cp(TEMPLATE_DIR, dir, {
-    recursive: true,
-    filter: (src) => !SKIP_DIRS.has(path.basename(src)),
-  });
+  const copyTemplate = (to: string) =>
+    fs.cp(TEMPLATE_DIR, to, { recursive: true, filter: (src) => !SKIP_DIRS.has(path.basename(src)) });
+
+  // Copy into a private folder, then rename into place, so a half-copied
+  // workspace is never visible under its real name.
+  const staging = `${dir}.init-${process.pid}-${Date.now()}`;
+  await copyTemplate(staging);
+  try {
+    await fs.rename(staging, dir);
+  } catch {
+    // The folder already exists (e.g. left partial by a crash): fill it in place.
+    await fs.rm(staging, { recursive: true, force: true });
+    await copyTemplate(dir);
+  }
   return { created: true };
 }
 

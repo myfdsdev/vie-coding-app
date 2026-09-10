@@ -38,7 +38,11 @@ const STOP_WORDS = new Set(
 );
 
 function taskApp(title: string, brief: string): string {
-  const briefLiteral = JSON.stringify(brief.trim().slice(0, 140) || 'A place to keep track of things to do.');
+  // "<" is escaped so user text can never form a tag (e.g. "</write>") inside the stream.
+  const briefLiteral = JSON.stringify(brief.trim().slice(0, 140) || 'A place to keep track of things to do.').replace(
+    /</g,
+    '\\u003c',
+  );
   const titleLiteral = JSON.stringify(title);
   return `I'll build a clean task board you can add to, check off and filter, and save it in the browser so nothing is lost on refresh.
 

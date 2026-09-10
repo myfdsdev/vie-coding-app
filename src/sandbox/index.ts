@@ -6,25 +6,26 @@ import type { Sandbox, SandboxProvider, SandboxStatus } from './types';
 /**
  * Provider selection and sandbox lifecycle helpers.
  *
- * State lives on globalThis because the custom server and Next's route bundles
- * load separate copies of this module; both must see the same sandboxes.
+ * In-flight creations live on globalThis because Next's route bundles each
+ * load their own copy of this module and must not race each other. The
+ * provider itself is stateless and stays module-scoped, so a code reload in
+ * dev never keeps running a stale class.
  */
 
 const SANDBOX_TIMEOUT_MS = 30 * 60 * 1000;
 
 interface SandboxRegistry {
-  provider?: SandboxProvider;
   pending: Map<string, Promise<Sandbox>>;
 }
 
 const g = globalThis as typeof globalThis & { __forgeSandboxes?: SandboxRegistry };
 const registry: SandboxRegistry = (g.__forgeSandboxes ??= { pending: new Map() });
 
+let provider: SandboxProvider | undefined;
+
 export function getSandboxProvider(): SandboxProvider {
-  if (!registry.provider) {
-    registry.provider = process.env.SANDBOX === 'mock' ? new MockSandboxProvider() : new DockerSandboxProvider();
-  }
-  return registry.provider;
+  provider ??= process.env.SANDBOX === 'mock' ? new MockSandboxProvider() : new DockerSandboxProvider();
+  return provider;
 }
 
 /**
