@@ -1,0 +1,8 @@
+# Everything is LF in the repo and in the working tree. The sandbox is Linux:
+# a CRLF entrypoint.sh makes the container exit immediately (SETUP-GUIDE §12).
+* text=auto eol=lf
+*.sh text eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary

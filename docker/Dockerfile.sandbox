@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# Sandbox image: one container per user project.
+#
+# Key idea: node_modules is baked into the image at /opt/preinstalled so a cold
+# start does NOT pay for `npm install`. The entrypoint copies it into the
+# project volume on first boot. This is the single biggest cold-start win
+# available to a self-hosted builder — seconds instead of a minute.
+# ---------------------------------------------------------------------------
+FROM node:20-bookworm-slim
+
+# tini gives us correct signal handling so `docker stop` is fast and clean.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Non-root from here on. Nothing in a sandbox should ever run as uid 0.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin app
+
+WORKDIR /opt/preinstalled
+
+# Dependency layer first so edits to template source do not bust the npm cache.
+COPY template/package.json ./package.json
+# NOTE: install scripts ARE allowed here. esbuild (and therefore Vite) fetches
+# a platform binary in postinstall; --ignore-scripts produces a broken image.
+# This runs at BUILD time against a pinned, trusted manifest — it is not the
+# same risk as running scripts for packages the AI adds at runtime.
+RUN npm install --no-audit --no-fund \
+ && npm cache clean --force
+
+# Template source layer.
+COPY template/ ./template/
+RUN mv ./node_modules ./template/node_modules \
+ && chown -R app:app /opt/preinstalled
+
+WORKDIR /app
+RUN chown app:app /app
+
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
+
+USER app
+ENV HOME=/tmp \
+    NODE_ENV=development \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false
+
+EXPOSE 5173
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

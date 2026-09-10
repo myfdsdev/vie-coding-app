@@ -1,0 +1,151 @@
+import { randomBytes } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+
+/**
+ * Project file store. The workspace folder on the host is the source of truth
+ * for a project's code; sandboxes receive copies of it.
+ *
+ * M0 has no database: a project is just workspaces/<id>/.
+ */
+
+export const WORKSPACES_DIR = path.join(process.cwd(), 'workspaces');
+export const TEMPLATE_DIR = path.join(process.cwd(), 'docker', 'template');
+
+/** Lowercase alphanumeric only — it becomes part of the preview hostname sbx-<id>. */
+const PROJECT_ID_RE = /^[a-z0-9]{4,32}$/;
+
+/** Never copied into a workspace, listed, or sent to the model or sandbox. */
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.vite']);
+
+/**
+ * Infrastructure the builder relies on. The model may not overwrite these:
+ * the preview shim and error boundary are how failures get reported at all.
+ */
+export const PROTECTED_PATHS = new Set([
+  'vite.config.ts',
+  'vite-plugin-preview-instrumentation.ts',
+  'src/ErrorBoundary.tsx',
+  'package-lock.json',
+]);
+
+export function newProjectId(): string {
+  // 10 base-36 characters; the first is a letter so ids never look numeric.
+  const letters = 'abcdefghijklmnopqrstuvwxyz';
+  const rest = BigInt('0x' + randomBytes(8).toString('hex')).toString(36).padStart(9, '0').slice(-9);
+  return letters[randomBytes(1)[0] % 26] + rest;
+}
+
+export function isProjectId(id: string): boolean {
+  return PROJECT_ID_RE.test(id);
+}
+
+export function assertProjectId(id: string): string {
+  if (!isProjectId(id)) throw new Error(`Invalid project id: ${JSON.stringify(id)}`);
+  return id;
+}
+
+export function workspaceDir(projectId: string): string {
+  return path.join(WORKSPACES_DIR, assertProjectId(projectId));
+}
+
+/**
+ * Normalise a model-supplied path to a safe, project-relative POSIX path.
+ * Throws on anything that could escape the workspace or touch managed folders.
+ */
+export function safeRelativePath(input: string): string {
+  const cleaned = input.trim().replace(/\\/g, '/').replace(/^\.\/+/, '');
+  if (!cleaned) throw new Error('Empty file path');
+  if (cleaned.startsWith('/') || /^[a-zA-Z]:/.test(cleaned)) throw new Error(`Absolute path not allowed: ${input}`);
+  const normalised = path.posix.normalize(cleaned);
+  if (normalised === '.' || normalised.startsWith('../') || normalised === '..') {
+    throw new Error(`Path escapes the project: ${input}`);
+  }
+  const first = normalised.split('/')[0];
+  if (SKIP_DIRS.has(first)) throw new Error(`Writing into ${first}/ is not allowed: ${input}`);
+  return normalised;
+}
+
+async function exists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Create workspaces/<id> from the starter template if it does not exist yet. */
+export async function ensureWorkspace(projectId: string): Promise<{ created: boolean }> {
+  const dir = workspaceDir(projectId);
+  if (await exists(path.join(dir, 'package.json'))) return { created: false };
+  await fs.mkdir(dir, { recursive: true });
+  await fs.cp(TEMPLATE_DIR, dir, {
+    recursive: true,
+    filter: (src) => !SKIP_DIRS.has(path.basename(src)),
+  });
+  return { created: true };
+}
+
+export async function projectExists(projectId: string): Promise<boolean> {
+  return isProjectId(projectId) && exists(path.join(workspaceDir(projectId), 'package.json'));
+}
+
+/** All project files as sorted, project-relative POSIX paths. */
+export async function listProjectFiles(projectId: string): Promise<string[]> {
+  const root = workspaceDir(projectId);
+  const out: string[] = [];
+  async function walk(dir: string, rel: string) {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) await walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
+      } else if (entry.isFile()) {
+        out.push(rel ? `${rel}/${entry.name}` : entry.name);
+      }
+    }
+  }
+  await walk(root, '');
+  // Deterministic order matters: context assembly depends on it for cache hits.
+  return out.sort();
+}
+
+export async function readProjectFile(projectId: string, rel: string): Promise<string | null> {
+  try {
+    return await fs.readFile(path.join(workspaceDir(projectId), safeRelativePath(rel)), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+/** Every project file with its content, sorted by path. */
+export async function readProjectFiles(projectId: string): Promise<{ path: string; content: string }[]> {
+  const paths = await listProjectFiles(projectId);
+  return Promise.all(
+    paths.map(async (p) => ({ path: p, content: await fs.readFile(path.join(workspaceDir(projectId), p), 'utf8') })),
+  );
+}
+
+export async function writeProjectFile(projectId: string, rel: string, content: string): Promise<void> {
+  const target = path.join(workspaceDir(projectId), safeRelativePath(rel));
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, content, 'utf8');
+}
+
+export async function deleteProjectFile(projectId: string, rel: string): Promise<boolean> {
+  try {
+    await fs.unlink(path.join(workspaceDir(projectId), safeRelativePath(rel)));
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+export async function renameProjectFile(projectId: string, from: string, to: string): Promise<void> {
+  const root = workspaceDir(projectId);
+  const target = path.join(root, safeRelativePath(to));
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.rename(path.join(root, safeRelativePath(from)), target);
+}

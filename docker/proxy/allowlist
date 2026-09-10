@@ -1,0 +1,21 @@
+# One extended-regex per line, matched against the destination host.
+# Start narrow. Every line you add is a hole in the sandbox.
+
+# --- npm ---
+^registry\.npmjs\.org$
+^.*\.npmjs\.org$
+^registry\.yarnpkg\.com$
+
+# --- esbuild / prebuilt binaries some deps fetch on install ---
+^.*\.jsdelivr\.net$
+^.*\.unpkg\.com$
+
+# --- fonts, if generated apps use them ---
+^fonts\.googleapis\.com$
+^fonts\.gstatic\.com$
+
+# --- add YOUR backend here, e.g. a Supabase project ---
+# ^[a-z0-9]+\.supabase\.co$
+
+# Deliberately NOT allowed: everything else. No arbitrary APIs, no mining
+# pools, no pastebins, no DNS-over-HTTPS endpoints.
