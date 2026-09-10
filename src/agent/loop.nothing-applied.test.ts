@@ -19,7 +19,7 @@ let runTurn: typeof runTurnFn;
 
 beforeAll(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-nothing-'));
-  for (const [key, value] of Object.entries({ FORGE_WORKSPACES_DIR: tmp, SANDBOX: 'mock' })) {
+  for (const [key, value] of Object.entries({ FORGE_WORKSPACES_DIR: tmp, FORGE_DATA_DIR: tmp, SANDBOX: 'mock' })) {
     saved[key] = process.env[key];
     process.env[key] = value;
   }

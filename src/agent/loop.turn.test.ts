@@ -13,7 +13,7 @@ import type { TurnEvent } from './types';
  * they are imported only after the environment is set.
  */
 
-const ENV = { FORGE_WORKSPACES_DIR: '', PROVIDER: 'mock', MOCK_DELAY_MS: '0', SANDBOX: 'mock' };
+const ENV = { FORGE_WORKSPACES_DIR: '', FORGE_DATA_DIR: '', PROVIDER: 'mock', MOCK_DELAY_MS: '0', SANDBOX: 'mock' };
 const saved: Record<string, string | undefined> = {};
 let tmp = '';
 let runTurn: typeof runTurnFn;
@@ -22,7 +22,7 @@ let MockSandbox: typeof MockSandboxClass;
 
 beforeAll(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-turn-'));
-  for (const [key, value] of Object.entries({ ...ENV, FORGE_WORKSPACES_DIR: tmp })) {
+  for (const [key, value] of Object.entries({ ...ENV, FORGE_WORKSPACES_DIR: tmp, FORGE_DATA_DIR: tmp })) {
     saved[key] = process.env[key];
     process.env[key] = value;
   }
@@ -34,11 +34,12 @@ beforeAll(async () => {
 
 afterAll(async () => {
   vi.restoreAllMocks();
+  (await import('../store/db')).closeDb();
   for (const [key, value] of Object.entries(saved)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  await fs.rm(tmp, { recursive: true, force: true });
+  await fs.rm(tmp, { recursive: true, force: true, maxRetries: 3 });
 });
 
 type Stamped = { at: number; e: TurnEvent };
