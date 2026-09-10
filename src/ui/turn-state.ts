@@ -66,7 +66,8 @@ export function applyTurnEvent(turn: AssistantTurn, e: TurnEvent): AssistantTurn
       const row: FileRow = { path, change: e.change, status: e.status, from: e.from, lines: e.lines, error: e.error };
       const idx = turn.files.findIndex((f) => f.path === path);
       const files = idx === -1 ? [...turn.files, row] : turn.files.map((f, i) => (i === idx ? { ...f, ...row } : f));
-      return { ...turn, files };
+      // The <changes> block has started, so the plan text is complete.
+      return { ...turn, files, plan: dropOrphanFence(turn.plan, 'end') };
     }
     case 'dependency':
       return { ...turn, dependencies: [...turn.dependencies, { spec: e.spec, status: e.status, detail: e.detail }] };
@@ -76,11 +77,37 @@ export function applyTurnEvent(turn: AssistantTurn, e: TurnEvent): AssistantTurn
       return { ...turn, warnings: [...turn.warnings, e.message] };
     case 'error':
       return { ...turn, error: e.message };
-    case 'turn-end':
-      return { ...turn, status: e.outcome, durationMs: e.durationMs, stage: undefined };
+    case 'turn-end': {
+      // Summary text only exists after a <changes> block, as do file rows.
+      const hadChanges = turn.files.length > 0 || turn.summary.length > 0;
+      return {
+        ...turn,
+        status: e.outcome,
+        durationMs: e.durationMs,
+        stage: undefined,
+        plan: hadChanges ? dropOrphanFence(turn.plan, 'end') : turn.plan,
+        summary: dropOrphanFence(turn.summary, 'start'),
+      };
+    }
     default:
       return turn;
   }
+}
+
+const FENCE_LINE = /^\s*```[\w-]*\s*$/;
+
+/**
+ * A model sometimes wraps the <changes> block in a markdown fence. The block
+ * is not shown, so its opening fence dangles at the end of the plan and its
+ * closing fence at the start of the summary. Drop that one orphaned fence
+ * line; balanced fences are left alone.
+ */
+export function dropOrphanFence(text: string, side: 'start' | 'end'): string {
+  const lines = text.split('\n');
+  const fences = lines.flatMap((line, i) => (FENCE_LINE.test(line) ? [i] : []));
+  if (fences.length % 2 === 0) return text;
+  const drop = side === 'end' ? fences[fences.length - 1] : fences[0];
+  return lines.filter((_, i) => i !== drop).join('\n');
 }
 
 /** Split an SSE byte stream into parsed TurnEvents. */

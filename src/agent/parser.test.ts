@@ -114,6 +114,24 @@ describe('ChangesParser', () => {
     expect(warnings).toHaveLength(3);
     expect(ops(events)).toEqual([]);
   });
+
+  it('accepts the path attribute under other names models use', () => {
+    // Gemini 3.1 Pro wrote <write file="...">; the file must not be dropped.
+    const text = `<changes>
+<write file="src/pages/Home.tsx">
+export default function Home() { return null; }
+</write>
+<write filename='src/b.ts'>export const b = 1;</write>
+<delete filePath="src/c.ts" />
+</changes>`;
+    const events = parseInChunks(text, 7);
+    expect(ops(events)).toEqual([
+      { type: 'write', path: 'src/pages/Home.tsx', content: 'export default function Home() { return null; }\n' },
+      { type: 'write', path: 'src/b.ts', content: 'export const b = 1;\n' },
+      { type: 'delete', path: 'src/c.ts' },
+    ]);
+    expect(events.some((e) => e.type === 'warning')).toBe(false);
+  });
 });
 
 describe('helpers', () => {
