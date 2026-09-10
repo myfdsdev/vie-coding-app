@@ -109,11 +109,17 @@ export async function runTurn({ projectId, message, emit, signal }: TurnInput): 
     emit({ type: 'stage', stage: 'execute' });
     emit({ type: 'sandbox', status: 'starting', detail: 'Starting the sandbox' });
     const sandbox = await sandboxPromise;
+    const wasServing = (await sandbox.status()) === 'ready';
     await syncToSandbox(sandbox, applied, emit);
     const status = await waitForReady(sandbox, 90_000);
     emit({ type: 'sandbox', status, previewUrl: sandbox.previewUrl(), detail: status === 'ready' ? 'Preview ready' : `Sandbox ${status}` });
     if (status !== 'ready') throw new Error(`The sandbox did not become ready (${status}).`);
-    if (applied.touched.length) emit({ type: 'preview-reload' });
+    if (needsPreviewRemount({ filesChanged: applied.touched.length > 0, wasServing, dependenciesChanged: applied.dependenciesChanged })) {
+      // Let Vite's polling watcher invalidate the modules just written, or the
+      // remounted page can load their previous version from its cache.
+      await new Promise((r) => setTimeout(r, WATCHER_SETTLE_MS));
+      emit({ type: 'preview-reload' });
+    }
 
     emit({ type: 'turn-end', outcome: ops.length ? 'success' : 'answered', durationMs: Date.now() - started, filesChanged });
   } catch (err) {
@@ -241,4 +247,17 @@ async function syncToSandbox(sandbox: Sandbox, applied: Applied, emit: (e: TurnE
     const install = await sandbox.installDependencies();
     if (!install.ok) emit({ type: 'warning', message: `Dependency install failed:\n${install.log.slice(-1200)}` });
   }
+}
+
+/** Four polling intervals of the sandbox's file watcher (300ms, docker/template/vite.config.ts). */
+export const WATCHER_SETTLE_MS = 1200;
+
+/**
+ * Whether the preview iframe must be remounted once this turn's files are in
+ * the sandbox. A dev server that was already serving pushes the change to the
+ * open preview over HMR, keeping app state; remounting there raced Vite's
+ * polling watcher and loaded the previous version of the changed modules.
+ */
+export function needsPreviewRemount(p: { filesChanged: boolean; wasServing: boolean; dependenciesChanged: boolean }): boolean {
+  return p.filesChanged && (!p.wasServing || p.dependenciesChanged);
 }
