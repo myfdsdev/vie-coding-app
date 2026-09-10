@@ -62,8 +62,8 @@ export function modelName(name: ProviderName, tier: ModelTier): string {
         : process.env.ANTHROPIC_MODEL || 'claude-opus-5';
     case 'gemini':
       return tier === 'fast'
-        ? process.env.GEMINI_FAST_MODEL || 'gemini-2.5-flash'
-        : process.env.GEMINI_MODEL || 'gemini-2.5-pro';
+        ? process.env.GEMINI_FAST_MODEL || 'gemini-3.5-flash'
+        : process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
     case 'mock':
       return 'mock';
   }
@@ -150,6 +150,27 @@ class AnthropicProvider implements ModelProvider {
 // Google Gemini (official @google/genai SDK)
 // ---------------------------------------------------------------------------
 
+/**
+ * The human sentence inside a provider error. The Gemini SDK nests the API's
+ * JSON error body inside another JSON envelope, which the chat would otherwise
+ * show as an escaped blob.
+ */
+export function readableProviderError(raw: string): string {
+  let message = raw;
+  for (let depth = 0; depth < 4; depth++) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(message);
+    } catch {
+      break;
+    }
+    const inner = (parsed as { error?: { message?: unknown } } | null)?.error?.message;
+    if (typeof inner !== 'string') break;
+    message = inner.trim();
+  }
+  return message;
+}
+
 class GeminiProvider implements ModelProvider {
   readonly name = 'gemini' as const;
   private readonly ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -159,37 +180,48 @@ class GeminiProvider implements ModelProvider {
   }
 
   async *stream(req: ModelRequest): AsyncGenerator<ModelEvent> {
-    const model = this.modelFor(req.tier ?? 'code');
-    // Gemini caches repeated prefixes implicitly; keep the same order as Anthropic.
-    const response = await this.ai.models.generateContentStream({
-      model,
-      contents: req.messages.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
-      config: {
-        systemInstruction: req.context ? `${req.system}\n\n${req.context}` : req.system,
-        maxOutputTokens: 65536,
-        abortSignal: req.signal,
-      },
-    });
-    let usage: { promptTokenCount?: number; candidatesTokenCount?: number; cachedContentTokenCount?: number } | undefined;
-    let stopReason = 'end_turn';
-    for await (const chunk of response) {
-      const text = chunk.text;
-      if (text) yield { type: 'text', text };
-      if (chunk.usageMetadata) usage = chunk.usageMetadata;
-      const finish = chunk.candidates?.[0]?.finishReason;
-      if (finish) stopReason = String(finish).toLowerCase();
+    const tier = req.tier ?? 'code';
+    const model = this.modelFor(tier);
+    try {
+      // Gemini caches repeated prefixes implicitly; keep the same order as Anthropic.
+      const response = await this.ai.models.generateContentStream({
+        model,
+        contents: req.messages.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+        config: {
+          systemInstruction: req.context ? `${req.system}\n\n${req.context}` : req.system,
+          maxOutputTokens: 65536,
+          abortSignal: req.signal,
+        },
+      });
+      let usage:
+        | { promptTokenCount?: number; candidatesTokenCount?: number; thoughtsTokenCount?: number; cachedContentTokenCount?: number }
+        | undefined;
+      let stopReason = 'end_turn';
+      for await (const chunk of response) {
+        const text = chunk.text;
+        if (text) yield { type: 'text', text };
+        if (chunk.usageMetadata) usage = chunk.usageMetadata;
+        const finish = chunk.candidates?.[0]?.finishReason;
+        if (finish) stopReason = String(finish).toLowerCase();
+      }
+      yield {
+        type: 'done',
+        model,
+        stopReason,
+        usage: {
+          inputTokens: usage?.promptTokenCount ?? 0,
+          // Gemini 3 models think before answering; thinking is billed as output.
+          outputTokens: (usage?.candidatesTokenCount ?? 0) + (usage?.thoughtsTokenCount ?? 0),
+          cacheReadTokens: usage?.cachedContentTokenCount ?? 0,
+          cacheWriteTokens: 0,
+        },
+      };
+    } catch (err) {
+      if (req.signal?.aborted || !(err instanceof Error)) throw err;
+      const setting = tier === 'fast' ? 'GEMINI_FAST_MODEL' : 'GEMINI_MODEL';
+      const hint = (err as { status?: number }).status === 404 ? ` Set ${setting} in .env.local to a model your key can use.` : '';
+      throw new Error(`Gemini (${model}): ${readableProviderError(err.message)}${hint}`);
     }
-    yield {
-      type: 'done',
-      model,
-      stopReason,
-      usage: {
-        inputTokens: usage?.promptTokenCount ?? 0,
-        outputTokens: usage?.candidatesTokenCount ?? 0,
-        cacheReadTokens: usage?.cachedContentTokenCount ?? 0,
-        cacheWriteTokens: 0,
-      },
-    };
   }
 }
 

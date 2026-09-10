@@ -53,7 +53,7 @@ docker run --rm --network vibe-sandboxes curlimages/curl:latest -sS --max-time 1
 
 ## Deviations from the kit, and why
 
-- **Model SDKs:** the official Anthropic SDK plus Gemini, instead of the Vercel AI SDK. Default models: `claude-opus-5` (or `claude-sonnet-5` via `ANTHROPIC_MODEL`), `gemini-2.5-pro`.
+- **Model SDKs:** the official Anthropic SDK plus Gemini, instead of the Vercel AI SDK. Default models: `claude-opus-5` (or `claude-sonnet-5` via `ANTHROPIC_MODEL`), `gemini-3.1-pro-preview` (fast tier `gemini-3.5-flash`). `gemini-2.5-pro` is no longer available to new API keys.
 - **Named volume instead of a bind mount** for `/app`. This repo lives on the Windows filesystem, where bind mounts are 10-50x slower and lose file-watch events. Files are pushed into the sandbox through the Docker API; `workspaces/<id>` stays the source of truth.
 - **`preview-gateway` (nginx) added to `docker/docker-compose.yml`.** On Docker Desktop the host cannot reach container IPs, so the preview proxy forwards to this gateway on `127.0.0.1:3100`, which reaches `vibe-sbx-<id>:5173` over the sandbox network. Sandboxes still publish no ports and have no internet.
 - The model may not overwrite `vite.config.ts`, the preview instrumentation plugin, `src/ErrorBoundary.tsx` or `package-lock.json`.
