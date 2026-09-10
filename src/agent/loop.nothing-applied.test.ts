@@ -23,8 +23,8 @@ beforeAll(async () => {
     saved[key] = process.env[key];
     process.env[key] = value;
   }
-  vi.doMock<typeof import('./providers')>('./providers', async (importOriginal) => ({
-    ...(await importOriginal()),
+  vi.doMock('./providers', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('./providers')>()),
     getProvider: () => ({
       name: 'mock',
       modelFor: () => 'broken-model',
