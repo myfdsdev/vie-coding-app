@@ -22,6 +22,7 @@ export type TurnEvent =
   | { type: 'text'; text: string; phase: 'before' | 'after' }
   | { type: 'file'; path: string; status: 'writing' | 'done' | 'failed'; change: FileChange; from?: string; lines?: number; error?: string }
   | { type: 'dependency'; spec: string; status: 'added' | 'rejected'; detail?: string }
+  | { type: 'checkpoint'; version: number; sha: string; subject: string }
   | { type: 'sandbox'; status: SandboxStatus; detail?: string; previewUrl?: string }
   | { type: 'preview-reload' }
   | { type: 'usage'; model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }

@@ -48,16 +48,14 @@ export function applyEdit(original: string, body: string): EditResult {
   let cursor = 0;
   for (let r = 0; r < runs.length; r++) {
     const run = runs[r];
-    const start = r === 0 && !leading ? 0 : locateStart(orig, run, cursor);
-    if (typeof start === 'string') return { ok: false, reason: start };
-    const end = r === runs.length - 1 && !trailing ? orig.length - 1 : locateEnd(orig, run, start);
-    if (typeof end === 'string') return { ok: false, reason: end };
-    const removed = end - start + 1 - run.length;
+    const spot = place(orig, run, cursor, r === 0 && !leading, r === runs.length - 1 && !trailing);
+    if (typeof spot === 'string') return { ok: false, reason: spot };
+    const removed = spot.end - spot.start + 1 - run.length;
     if (removed > MAX_EXTRA_REMOVED) {
       return { ok: false, reason: `Placing the change after "${run[0].trim()}" would delete ${removed} lines.` };
     }
-    placed.push({ start, end, lines: run });
-    cursor = end + 1;
+    placed.push({ ...spot, lines: run });
+    cursor = spot.end + 1;
   }
 
   const out: string[] = [];
@@ -106,37 +104,60 @@ function suffixMatch(orig: string[], run: string[], j: number, floor: number, eq
   return k;
 }
 
-/** The single index with the best score, or why there is none. */
-function best(orig: string[], from: number, score: (i: number) => number): number | 'none' | 'ambiguous' {
-  let top = 0;
-  let at: number[] = [];
-  for (let i = from; i < orig.length; i++) {
-    const s = score(i);
-    if (s === 0 || s < top) continue;
-    if (s > top) {
-      top = s;
-      at = [i];
-    } else at.push(i);
-  }
-  if (!at.length) return 'none';
-  return at.length === 1 ? at[0] : 'ambiguous';
-}
-
-function locateStart(orig: string[], run: string[], from: number): number | string {
-  for (const eq of [exact, loose]) {
-    const found = best(orig, from, (i) => prefixMatch(orig, run, i, eq));
-    if (found === 'ambiguous') return `"${run[0].trim()}" appears more than once, so the change can't be placed.`;
-    if (found !== 'none') return found;
-  }
-  return `"${run[0].trim()}" isn't in the file, so the change can't be placed.`;
-}
-
-function locateEnd(orig: string[], run: string[], start: number): number | string {
+/**
+ * Where the run replaces original lines. Start and end are judged together:
+ * a start line that occurs twice is fine if only one occurrence is followed
+ * by the run's end line. Ties at the best score are refused as ambiguous.
+ */
+function place(
+  orig: string[],
+  run: string[],
+  from: number,
+  atFileStart: boolean,
+  atFileEnd: boolean,
+): { start: number; end: number } | string {
+  const first = run[0].trim();
   const last = run[run.length - 1].trim();
+  let sawStart = false;
   for (const eq of [exact, loose]) {
-    const found = best(orig, start, (j) => suffixMatch(orig, run, j, start, eq));
-    if (found === 'ambiguous') return `"${last}" appears more than once after "${run[0].trim()}", so the change can't be placed.`;
-    if (found !== 'none') return found;
+    const starts: { at: number; score: number }[] = [];
+    if (atFileStart) starts.push({ at: 0, score: 0 });
+    else {
+      for (let i = from; i < orig.length; i++) {
+        const score = prefixMatch(orig, run, i, eq);
+        if (score) starts.push({ at: i, score });
+      }
+    }
+    if (starts.length) sawStart = true;
+
+    const pairs: { start: number; end: number; score: number; ambiguous: boolean }[] = [];
+    for (const s of starts) {
+      if (atFileEnd) {
+        pairs.push({ start: s.at, end: orig.length - 1, score: s.score, ambiguous: false });
+        continue;
+      }
+      let top = 0;
+      let ends: number[] = [];
+      for (let j = s.at; j < orig.length; j++) {
+        const score = suffixMatch(orig, run, j, s.at, eq);
+        if (!score || score < top) continue;
+        if (score > top) {
+          top = score;
+          ends = [j];
+        } else ends.push(j);
+      }
+      if (ends.length) pairs.push({ start: s.at, end: ends[0], score: s.score + top, ambiguous: ends.length > 1 });
+    }
+    if (!pairs.length) continue;
+
+    const topScore = Math.max(...pairs.map((p) => p.score));
+    const winners = pairs.filter((p) => p.score === topScore);
+    if (winners.length > 1 || winners[0].ambiguous) {
+      return `The lines around "${first}" appear more than once, so the change can't be placed.`;
+    }
+    return { start: winners[0].start, end: winners[0].end };
   }
-  return `"${last}" isn't in the file after "${run[0].trim()}", so the change can't be placed.`;
+  return sawStart
+    ? `"${last}" isn't in the file after "${first}", so the change can't be placed.`
+    : `"${first}" isn't in the file, so the change can't be placed.`;
 }

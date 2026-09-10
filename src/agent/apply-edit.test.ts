@@ -15,15 +15,19 @@ export default function App() {
 
 describe('applyEdit', () => {
   it('splices each run between its unchanged first and last lines', () => {
+    // The example in the system prompt, applied to the starter App.tsx.
     const body = `// ... existing code ...
+import { Routes, Route } from 'react-router-dom';
 import Home from './pages/Home';
 import About from './pages/About';
 
 export default function App() {
 // ... existing code ...
+    <Routes>
       <Route path="/" element={<Home />} />
       <Route path="/about" element={<About />} />
     </Routes>
+  );
 // ... existing code ...
 `;
     expect(applyEdit(APP, body)).toEqual({
@@ -51,9 +55,12 @@ export default function App() {
     if (!result.ok) expect(result.reason).toMatch(/isn't in the file/);
   });
 
-  it('refuses an anchor that appears more than once', () => {
-    const result = applyEdit('a\nx\nb\nx\nc\n', '// ... existing code ...\nx\nnew line\nb\n// ... existing code ...\n');
-    expect(result.ok).toBe(true); // "x" twice, but "x" followed by... only the first x is followed by b
+  it('uses the end line to tell repeated start lines apart, and refuses real ambiguity', () => {
+    // "x" occurs twice, but only the first is followed by "b".
+    expect(applyEdit('a\nx\nb\nx\nc\n', '// ... existing code ...\nx\nnew line\nb\n// ... existing code ...\n')).toEqual({
+      ok: true,
+      content: 'a\nx\nnew line\nb\nx\nc\n',
+    });
     const ambiguous = applyEdit('a\nx\nb\nx\nb\n', '// ... existing code ...\nx\nchanged\nb\n// ... existing code ...\n');
     expect(ambiguous.ok).toBe(false);
     if (!ambiguous.ok) expect(ambiguous.reason).toMatch(/more than once/);

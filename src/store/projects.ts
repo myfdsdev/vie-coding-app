@@ -173,3 +173,77 @@ export async function renameProjectFile(projectId: string, from: string, to: str
   await fs.mkdir(path.dirname(target), { recursive: true });
   await fs.rename(path.join(root, safeRelativePath(from)), target);
 }
+
+// ---------------------------------------------------------------------------
+// Project records (database). The workspace folder holds the code; the row
+// holds what the project list needs.
+// ---------------------------------------------------------------------------
+
+export interface Project {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+type ProjectRow = { id: string; name: string; created_at: number; updated_at: number };
+
+const toProject = (r: ProjectRow): Project => ({ id: r.id, name: r.name, createdAt: r.created_at, updatedAt: r.updated_at });
+
+const NAME_STOP_WORDS = new Set(
+  'a an the me my our your i we you to for of and or with that this app application build make create please can could would want need simple small little tool website site page which where who will so it in on some just'.split(
+    ' ',
+  ),
+);
+
+/** "Build me a recipe box with cook times!" -> "recipe-box-cook" */
+export function projectNameFrom(prompt: string): string {
+  const words = prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w && !NAME_STOP_WORDS.has(w))
+    .slice(0, 3);
+  return words.join('-') || 'untitled';
+}
+
+/** A new project: its workspace from the template and its row. */
+export async function createProject(name = 'untitled'): Promise<Project> {
+  const id = newProjectId();
+  await ensureWorkspace(id);
+  return ensureProject(id, name);
+}
+
+/** The project's row, created on first sight (workspaces from before M1 have none). */
+export function ensureProject(id: string, name?: string): Project {
+  assertProjectId(id);
+  const now = Date.now();
+  const conn = db();
+  conn
+    .prepare('INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING')
+    .run(id, name ?? id, now, now);
+  return toProject(conn.prepare('SELECT * FROM projects WHERE id = ?').get(id) as ProjectRow);
+}
+
+export function getProject(id: string): Project | null {
+  if (!isProjectId(id)) return null;
+  const row = db().prepare('SELECT * FROM projects WHERE id = ?').get(id) as ProjectRow | undefined;
+  return row ? toProject(row) : null;
+}
+
+/** Most recently active first. */
+export function listProjects(limit = 24): Project[] {
+  const rows = db().prepare('SELECT * FROM projects ORDER BY updated_at DESC, rowid DESC LIMIT ?').all(limit) as ProjectRow[];
+  return rows.map(toProject);
+}
+
+/** Record activity. A project still named after its id (or "untitled") takes `name`. */
+export function touchProject(id: string, name?: string): void {
+  db()
+    .prepare(
+      `UPDATE projects SET updated_at = ?,
+         name = CASE WHEN ? IS NOT NULL AND (name = id OR name = 'untitled') THEN ? ELSE name END
+       WHERE id = ?`,
+    )
+    .run(Date.now(), name ?? null, name ?? null, id);
+}
