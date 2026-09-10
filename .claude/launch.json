@@ -6,6 +6,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev:mock"],
       "port": 3000
+    },
+    {
+      "name": "forge-mock-localhost",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["cross-env", "PROVIDER=mock", "PREVIEW_DOMAIN=localhost", "tsx", "server.ts"],
+      "port": 3000
     }
   ]
 }
