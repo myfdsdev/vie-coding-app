@@ -42,9 +42,15 @@ export function buildContext(files: { path: string; content: string }[]): string
  * What an assistant turn contributes to later history: the prose, with the
  * <changes> block replaced by a list of touched paths. The files block already
  * carries current contents, so repeating old code would only bloat context.
+ * When none of the changes could be applied, `problem` says why, so the model
+ * knows its previous reply changed nothing.
  */
-export function historyEntryFor(response: string, touched: string[]): string {
-  const prose = response.replace(/<changes>[\s\S]*?(<\/changes>|$)/g, '').trim();
+export function historyEntryFor(response: string, touched: string[], problem?: string): string {
+  const prose = response
+    .replace(/<changes>[\s\S]*?(<\/changes>|$)/g, '')
+    .replace(/```[\w-]*\s*```/g, '') // a fence the model wrapped around the block, now empty
+    .trim();
   const files = touched.length ? `\n[changed files: ${touched.join(', ')}]` : '';
-  return (prose || '(no reply)') + files;
+  const failed = problem ? `\n[none of these changes were applied: ${problem}]` : '';
+  return (prose || '(no reply)') + files + failed;
 }

@@ -79,13 +79,19 @@ export async function runTurn({ projectId, message, emit, signal }: TurnInput): 
     let usage: ModelUsage | null = null;
     let usedModel = model;
 
+    // Parse problems and failed file operations: if they leave nothing
+    // applied, the turn must not end looking like a success.
+    const problems: string[] = [];
     const onParse = (events: ParseEvent[]) => {
       for (const e of events) {
         if (e.type === 'text') emit({ type: 'text', text: e.text, phase: e.phase });
         else if (e.type === 'file-start') {
           emit({ type: 'file', path: e.path, status: 'writing', change: known.has(normalise(e.path)) ? 'modified' : 'created' });
         } else if (e.type === 'op') ops.push(e.op);
-        else if (e.type === 'warning') emit({ type: 'warning', message: e.message });
+        else if (e.type === 'warning') {
+          problems.push(e.message);
+          emit({ type: 'warning', message: e.message });
+        }
       }
     };
 
@@ -103,12 +109,21 @@ export async function runTurn({ projectId, message, emit, signal }: TurnInput): 
 
     // 5 APPLY — the full response arrived intact; now write it to the store
     emit({ type: 'stage', stage: 'apply' });
-    const applied = await applyOps(projectId, ops, known, emit);
+    const applied = await applyOps(projectId, ops, known, (e) => {
+      if (e.type === 'file' && e.status === 'failed') problems.push(`${e.path}: ${e.error}`);
+      emit(e);
+    });
     filesChanged = applied.touched.length;
+    // The model sent changes but none could be used: say so rather than let its
+    // own "done" sentence stand, and tell the model in its history.
+    const nothingApplied = parser.sawChanges && applied.touched.length === 0 && problems.length > 0;
     histories.set(projectId, [
       ...messages,
-      { role: 'assistant', content: historyEntryFor(response, applied.touched) },
+      { role: 'assistant', content: historyEntryFor(response, applied.touched, nothingApplied ? problems.join('; ') : undefined) },
     ]);
+    if (nothingApplied) {
+      throw new Error("The AI's reply contained changes Forge couldn't use, so nothing in your app changed. Send your message again.");
+    }
 
     // 8 EXECUTE — push the change into the sandbox and wait for the dev server
     emit({ type: 'stage', stage: 'execute' });
