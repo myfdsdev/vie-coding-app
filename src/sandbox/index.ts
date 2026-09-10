@@ -1,4 +1,4 @@
-import { readProjectFiles } from '../store/projects';
+import { readProjectFile, readProjectFiles } from '../store/projects';
 import { DockerSandboxProvider } from './docker';
 import { MockSandboxProvider } from './mock';
 import type { Sandbox, SandboxProvider, SandboxStatus } from './types';
@@ -60,4 +60,19 @@ export async function waitForReady(sandbox: Sandbox, timeoutMs = 60_000): Promis
     status = await sandbox.status();
   }
   return status;
+}
+
+/**
+ * Bring a sandbox up to date after the workspace changed outside a turn (a
+ * version restore): exactly the given files, then dependencies if needed.
+ */
+export async function pushWorkspaceChanges(projectId: string, change: { written: string[]; deleted: string[] }): Promise<Sandbox> {
+  const sandbox = await ensureSandbox(projectId);
+  if (change.deleted.length) await sandbox.deleteFiles(change.deleted);
+  const files = await Promise.all(
+    change.written.map(async (path) => ({ path, content: (await readProjectFile(projectId, path)) ?? '' })),
+  );
+  if (files.length) await sandbox.writeFiles(files);
+  if (change.written.includes('package.json')) await sandbox.installDependencies();
+  return sandbox;
 }

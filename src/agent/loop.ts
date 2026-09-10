@@ -1,29 +1,35 @@
 import { randomUUID } from 'node:crypto';
 import { ensureSandbox, waitForReady } from '../sandbox';
 import type { Sandbox } from '../sandbox/types';
+import { appendHistory, getHistory, takePendingNote } from '../store/chats';
+import { checkpoint, ensureRepo } from '../store/checkpoints';
 import {
   PROTECTED_PATHS,
   deleteProjectFile,
+  ensureProject,
   ensureWorkspace,
+  projectNameFrom,
   readProjectFile,
   readProjectFiles,
   renameProjectFile,
   safeRelativePath,
+  touchProject,
   writeProjectFile,
 } from '../store/projects';
+import { applyEdit } from './apply-edit';
 import { buildContext, historyEntryFor } from './context';
 import { ChangesParser, type ChangeOp, type ParseEvent } from './parser';
 import { SYSTEM_PROMPT } from './prompt';
-import { getProvider, type ModelMessage, type ModelUsage } from './providers';
+import { getProvider, type ModelMessage, type ModelProvider, type ModelUsage } from './providers';
 import type { FileChange, TurnEvent } from './types';
 
 /**
- * The agent turn (BUILD-PROMPT §7), M0 scope.
+ * The agent turn (BUILD-PROMPT §7), M1 scope.
  *
- * M0 proves the loop: prompt -> model -> parse tags -> files -> sandbox ->
- * preview. The numbered stage comments below are the §7 stages this
- * milestone implements; ROUTE, STREAM FIX, VALIDATE, CHECKPOINT, COLLECT and
- * DECIDE arrive in M1-M3 at the positions their numbers indicate.
+ * Stages here: 2 CONTEXT, 3 PLAN+EMIT, 5 APPLY (whole files and placed
+ * edits), 7 CHECKPOINT (a git commit per turn) and 8 EXECUTE. ROUTE, STREAM
+ * FIX, VALIDATE, COLLECT, DECIDE and METER arrive in M2-M3 at the positions
+ * their numbers indicate.
  */
 
 export interface TurnInput {
@@ -33,26 +39,38 @@ export interface TurnInput {
   signal: AbortSignal;
 }
 
-// M0 has no persistence: history lives in memory for the life of the server.
-const g = globalThis as typeof globalThis & { __forgeHistory?: Map<string, ModelMessage[]> };
-const histories = (g.__forgeHistory ??= new Map<string, ModelMessage[]>());
-
 interface Applied {
   written: { path: string; content: string }[];
   deleted: string[];
   dependenciesChanged: boolean;
   touched: string[];
+  /** <edit>s apply-edit.ts could not place; they are asked for again as whole files. */
+  failedEdits: { path: string; reason: string }[];
+}
+
+/** One model call and the file operations it produced. */
+interface Pass {
+  response: string;
+  applied: Applied;
+  problems: string[];
+  sawChanges: boolean;
+  usage: ModelUsage | null;
+  model: string;
 }
 
 export async function runTurn({ projectId, message, emit, signal }: TurnInput): Promise<void> {
   const started = Date.now();
+  const turnId = randomUUID();
   const provider = getProvider();
-  const model = provider.modelFor('code');
-  emit({ type: 'turn-start', turnId: randomUUID(), provider: provider.name, model });
+  emit({ type: 'turn-start', turnId, provider: provider.name, model: provider.modelFor('code') });
 
   let filesChanged = 0;
   try {
     await ensureWorkspace(projectId);
+    ensureProject(projectId);
+    touchProject(projectId, projectNameFrom(message));
+    // v1 must be the state before this turn, or the turn's changes would vanish into it.
+    await ensureRepo(projectId).catch((err: Error) => emit({ type: 'warning', message: `Version history is unavailable: ${err.message}` }));
 
     // Boot (or resume) the sandbox now, in parallel with the model call —
     // the user should never wait for a cold start after the code is written.
@@ -66,63 +84,59 @@ export async function runTurn({ projectId, message, emit, signal }: TurnInput): 
 
     // 2 CONTEXT — cache-stable: system prompt, files sorted by path, history, message
     emit({ type: 'stage', stage: 'context' });
-    const files = await readProjectFiles(projectId);
-    const known = new Set(files.map((f) => f.path));
-    const history = histories.get(projectId) ?? [];
-    const messages: ModelMessage[] = [...history, { role: 'user', content: message }];
+    const note = takePendingNote(projectId);
+    const userContent = note ? `[${note}]\n\n${message}` : message;
+    const conversation: ModelMessage[] = [...getHistory(projectId), { role: 'user', content: userContent }];
 
-    // 3 PLAN+EMIT — stream from the model, parsing <changes> incrementally
-    emit({ type: 'stage', stage: 'emit', detail: model });
-    const parser = new ChangesParser();
-    const ops: ChangeOp[] = [];
-    let response = '';
-    let usage: ModelUsage | null = null;
-    let usedModel = model;
+    // 3 PLAN+EMIT and 5 APPLY
+    const first = await modelPass({ projectId, provider, conversation, emit, signal });
+    let applied = first.applied;
+    const problems = [...first.problems];
+    const usages = [first.usage];
 
-    // Parse problems and failed file operations: if they leave nothing
-    // applied, the turn must not end looking like a success.
-    const problems: string[] = [];
-    const onParse = (events: ParseEvent[]) => {
-      for (const e of events) {
-        if (e.type === 'text') emit({ type: 'text', text: e.text, phase: e.phase });
-        else if (e.type === 'file-start') {
-          emit({ type: 'file', path: e.path, status: 'writing', change: known.has(normalise(e.path)) ? 'modified' : 'created' });
-        } else if (e.type === 'op') ops.push(e.op);
-        else if (e.type === 'warning') {
-          problems.push(e.message);
-          emit({ type: 'warning', message: e.message });
-        }
-      }
-    };
-
-    for await (const ev of provider.stream({ system: SYSTEM_PROMPT, context: buildContext(files), messages, signal })) {
-      if (ev.type === 'text') {
-        response += ev.text;
-        onParse(parser.push(ev.text));
-      } else {
-        usage = ev.usage;
-        usedModel = ev.model;
-      }
+    // An <edit> that cannot be placed exactly is asked for once more as a
+    // whole file (§6c), never applied approximately.
+    if (applied.failedEdits.length) {
+      const retry = await modelPass({
+        projectId,
+        provider,
+        emit,
+        signal,
+        conversation: [
+          ...conversation,
+          { role: 'assistant', content: first.response },
+          { role: 'user', content: wholeFilePrompt(applied.failedEdits) },
+        ],
+        label: `Rewriting ${applied.failedEdits.map((f) => f.path).join(', ')} in full`,
+      });
+      usages.push(retry.usage);
+      problems.push(...retry.problems);
+      applied = mergeApplied(applied, retry.applied);
     }
-    onParse(parser.end());
-    if (usage) emit({ type: 'usage', model: usedModel, ...usage });
-
-    // 5 APPLY — the full response arrived intact; now write it to the store
-    emit({ type: 'stage', stage: 'apply' });
-    const applied = await applyOps(projectId, ops, known, (e) => {
-      if (e.type === 'file' && e.status === 'failed') problems.push(`${e.path}: ${e.error}`);
-      emit(e);
-    });
     filesChanged = applied.touched.length;
+    const usage = sumUsage(usages);
+    if (usage) emit({ type: 'usage', model: first.model, ...usage });
+
     // The model sent changes but none could be used: say so rather than let its
     // own "done" sentence stand, and tell the model in its history.
-    const nothingApplied = parser.sawChanges && applied.touched.length === 0 && problems.length > 0;
-    histories.set(projectId, [
-      ...messages,
-      { role: 'assistant', content: historyEntryFor(response, applied.touched, nothingApplied ? problems.join('; ') : undefined) },
+    const nothingApplied = first.sawChanges && applied.touched.length === 0 && problems.length > 0;
+    appendHistory(projectId, [
+      { role: 'user', content: userContent },
+      { role: 'assistant', content: historyEntryFor(first.response, applied.touched, nothingApplied ? problems.join('; ') : undefined) },
     ]);
     if (nothingApplied) {
       throw new Error("The AI's reply contained changes Forge couldn't use, so nothing in your app changed. Send your message again.");
+    }
+
+    // 7 CHECKPOINT — a git commit before the sandbox ever sees the change
+    if (applied.touched.length) {
+      emit({ type: 'stage', stage: 'checkpoint' });
+      try {
+        const version = await checkpoint(projectId, { subject: message, kind: 'turn', turnId });
+        if (version) emit({ type: 'checkpoint', version: version.number, sha: version.sha, subject: version.subject });
+      } catch (err) {
+        emit({ type: 'warning', message: `This change was not saved as a version: ${(err as Error).message}` });
+      }
     }
 
     // 8 EXECUTE — push the change into the sandbox and wait for the dev server
@@ -146,7 +160,7 @@ export async function runTurn({ projectId, message, emit, signal }: TurnInput): 
       emit({ type: 'preview-reload' });
     }
 
-    emit({ type: 'turn-end', outcome: ops.length ? 'success' : 'answered', durationMs: Date.now() - started, filesChanged });
+    emit({ type: 'turn-end', outcome: first.sawChanges ? 'success' : 'answered', durationMs: Date.now() - started, filesChanged });
   } catch (err) {
     if (signal.aborted) {
       emit({ type: 'turn-end', outcome: 'stopped', durationMs: Date.now() - started, filesChanged });
@@ -155,6 +169,96 @@ export async function runTurn({ projectId, message, emit, signal }: TurnInput): 
     emit({ type: 'error', message: err instanceof Error ? err.message : String(err) });
     emit({ type: 'turn-end', outcome: 'failed', durationMs: Date.now() - started, filesChanged });
   }
+}
+
+/** 3 PLAN+EMIT and 5 APPLY for one model call. */
+async function modelPass(opts: {
+  projectId: string;
+  provider: ModelProvider;
+  conversation: ModelMessage[];
+  emit: (e: TurnEvent) => void;
+  signal: AbortSignal;
+  /** Set for the whole-file retry, whose prose stays out of the chat; only its files show. */
+  label?: string;
+}): Promise<Pass> {
+  const { projectId, provider, conversation, emit, signal, label } = opts;
+  const files = await readProjectFiles(projectId);
+  const known = new Set(files.map((f) => f.path));
+  emit({ type: 'stage', stage: 'emit', detail: label });
+
+  const parser = new ChangesParser();
+  const ops: ChangeOp[] = [];
+  // Parse problems and failed file operations: if they leave nothing
+  // applied, the turn must not end looking like a success.
+  const problems: string[] = [];
+  let response = '';
+  let usage: ModelUsage | null = null;
+  let model = provider.modelFor('code');
+
+  const onParse = (events: ParseEvent[]) => {
+    for (const e of events) {
+      if (e.type === 'text') {
+        if (!label) emit({ type: 'text', text: e.text, phase: e.phase });
+      } else if (e.type === 'file-start') {
+        emit({ type: 'file', path: e.path, status: 'writing', change: known.has(normalise(e.path)) ? 'modified' : 'created' });
+      } else if (e.type === 'op') ops.push(e.op);
+      else if (e.type === 'warning') {
+        problems.push(e.message);
+        emit({ type: 'warning', message: e.message });
+      }
+    }
+  };
+
+  for await (const ev of provider.stream({ system: SYSTEM_PROMPT, context: buildContext(files), messages: conversation, signal })) {
+    if (ev.type === 'text') {
+      response += ev.text;
+      onParse(parser.push(ev.text));
+    } else {
+      usage = ev.usage;
+      model = ev.model;
+    }
+  }
+  onParse(parser.end());
+
+  emit({ type: 'stage', stage: 'apply' });
+  const applied = await applyOps(projectId, ops, known, (e) => {
+    if (e.type === 'file' && e.status === 'failed') problems.push(`${e.path}: ${e.error}`);
+    emit(e);
+  });
+  return { response, applied, problems, sawChanges: parser.sawChanges, usage, model };
+}
+
+function wholeFilePrompt(failed: { path: string; reason: string }[]): string {
+  return [
+    'These edits could not be placed exactly, so they were NOT applied:',
+    ...failed.map((f) => `- ${f.path}: ${f.reason}`),
+    '',
+    'The project files above show the current content. Send each of these files again as a COMPLETE file with <write path="...">, including every change you intended. Change nothing else.',
+  ].join('\n');
+}
+
+/** The retry's results win for any file both passes touched. */
+function mergeApplied(a: Applied, b: Applied): Applied {
+  const rewritten = new Set(b.written.map((w) => w.path));
+  const removed = new Set(b.deleted);
+  return {
+    written: [...a.written.filter((w) => !rewritten.has(w.path) && !removed.has(w.path)), ...b.written],
+    deleted: [...new Set([...a.deleted.filter((d) => !rewritten.has(d)), ...b.deleted])],
+    dependenciesChanged: a.dependenciesChanged || b.dependenciesChanged,
+    touched: [...new Set([...a.touched, ...b.touched])],
+    failedEdits: b.failedEdits,
+  };
+}
+
+function sumUsage(usages: (ModelUsage | null)[]): ModelUsage | null {
+  const real = usages.filter((u): u is ModelUsage => u !== null);
+  if (!real.length) return null;
+  return real.reduce((a, b) => ({
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+  }));
 }
 
 function normalise(path: string): string {
@@ -171,8 +275,15 @@ async function applyOps(
   known: Set<string>,
   emit: (e: TurnEvent) => void,
 ): Promise<Applied> {
-  const applied: Applied = { written: [], deleted: [], dependenciesChanged: false, touched: [] };
+  const applied: Applied = { written: [], deleted: [], dependenciesChanged: false, touched: [], failedEdits: [] };
   const fail = (path: string, change: FileChange, error: string) => emit({ type: 'file', path, status: 'failed', change, error });
+  const record = (path: string, content: string, change: FileChange) => {
+    applied.written.push({ path, content });
+    applied.touched.push(path);
+    known.add(path);
+    if (path === 'package.json') applied.dependenciesChanged = true;
+    emit({ type: 'file', path, status: 'done', change, lines: content.split('\n').length - 1 });
+  };
 
   for (const op of ops) {
     if (op.type === 'write') {
@@ -184,13 +295,28 @@ async function applyOps(
           continue;
         }
         await writeProjectFile(projectId, path, op.content);
-        applied.written.push({ path, content: op.content });
-        applied.touched.push(path);
-        known.add(path);
-        if (path === 'package.json') applied.dependenciesChanged = true;
-        emit({ type: 'file', path, status: 'done', change, lines: op.content.split('\n').length - 1 });
+        record(path, op.content, change);
       } catch (err) {
         fail(op.path, change, (err as Error).message);
+      }
+    } else if (op.type === 'edit') {
+      try {
+        const path = safeRelativePath(op.path);
+        if (PROTECTED_PATHS.has(path)) {
+          fail(path, 'modified', 'This file is managed by the builder and cannot be changed.');
+          continue;
+        }
+        const current = await readProjectFile(projectId, path);
+        const result = current === null ? { ok: false as const, reason: "The file doesn't exist yet, so it can't be edited." } : applyEdit(current, op.body);
+        if (!result.ok) {
+          applied.failedEdits.push({ path, reason: result.reason });
+          fail(path, 'modified', result.reason);
+          continue;
+        }
+        await writeProjectFile(projectId, path, result.content);
+        record(path, result.content, 'modified');
+      } catch (err) {
+        fail(op.path, 'modified', (err as Error).message);
       }
     } else if (op.type === 'delete') {
       try {
@@ -236,9 +362,6 @@ async function applyOps(
         applied.dependenciesChanged = true;
         if (!applied.touched.includes('package.json')) applied.touched.push('package.json');
       }
-    } else {
-      // Lazy-diff <edit> application is the M1 applier; M0 fails it loudly.
-      fail(op.path, 'modified', 'Partial <edit> changes are not supported yet (arrives in M1). Nothing was applied.');
     }
   }
   return applied;

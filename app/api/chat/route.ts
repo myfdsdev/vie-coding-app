@@ -1,7 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { runTurn } from '@/agent/loop';
 import type { TurnEvent } from '@/agent/types';
+import { appendMessages } from '@/store/chats';
 import { isProjectId } from '@/store/projects';
+import { applyTurnEvent, newAssistantTurn, type UserMessage } from '@/ui/turn-state';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -11,7 +14,7 @@ const Body = z.object({
   message: z.string().trim().min(1).max(20_000),
 });
 
-/** SSE endpoint: one agent turn, streamed as TurnEvents. */
+/** SSE endpoint: one agent turn, streamed as TurnEvents and saved to the chat when it ends. */
 export async function POST(req: Request) {
   const parsed = Body.safeParse(await req.json().catch(() => null));
   if (!parsed.success || !isProjectId(parsed.data.projectId)) {
@@ -22,11 +25,16 @@ export async function POST(req: Request) {
   const abort = new AbortController();
   req.signal.addEventListener('abort', () => abort.abort());
   const encoder = new TextEncoder();
+  const key = randomUUID();
+  const user: UserMessage = { id: `u-${key}`, role: 'user', text: message };
+  // The same reducer the builder uses, so a reloaded chat looks exactly as it streamed.
+  let turn = newAssistantTurn(`a-${key}`);
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let open = true;
       const emit = (event: TurnEvent) => {
+        turn = applyTurnEvent(turn, event);
         if (!open) return;
         try {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
@@ -35,6 +43,11 @@ export async function POST(req: Request) {
         }
       };
       await runTurn({ projectId, message, emit, signal: abort.signal });
+      try {
+        appendMessages(projectId, [user, turn]);
+      } catch (err) {
+        console.error('[forge] could not save the chat', err);
+      }
       open = false;
       try {
         controller.close();

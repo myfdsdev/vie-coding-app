@@ -37,6 +37,8 @@ export interface AssistantTurn {
   usage?: Usage;
   error?: string;
   durationMs?: number;
+  /** The version this turn was saved as (git checkpoint). */
+  version?: { number: number; sha: string };
 }
 
 export type ChatMessage = UserMessage | AssistantTurn;
@@ -49,6 +51,7 @@ const STAGE_LABEL: Record<string, string> = {
   context: 'Reading the project',
   emit: 'Writing code',
   apply: 'Saving files',
+  checkpoint: 'Saving a version',
   execute: 'Updating the preview',
 };
 
@@ -58,7 +61,9 @@ export function applyTurnEvent(turn: AssistantTurn, e: TurnEvent): AssistantTurn
     case 'turn-start':
       return { ...turn, model: e.model };
     case 'stage':
-      return { ...turn, stage: STAGE_LABEL[e.stage] ?? e.stage };
+      return { ...turn, stage: e.detail ?? STAGE_LABEL[e.stage] ?? e.stage };
+    case 'checkpoint':
+      return { ...turn, version: { number: e.version, sha: e.sha } };
     case 'text':
       return e.phase === 'before' ? { ...turn, plan: turn.plan + e.text } : { ...turn, summary: turn.summary + e.text };
     case 'file': {
