@@ -23,10 +23,68 @@ const TABLE: { match: RegExp; diagnose: (m: RegExpMatchArray) => Diagnosis }[] =
     }),
   },
   {
-    match: /Cannot find module '(.+?)'|Could not resolve "(.+?)"/,
+    match: /Cannot find module '(\.{1,2}\/[^']+)'/,
+    diagnose: (m) => ({
+      cause: `The file "${m[1]}" does not exist. Either create it or fix the import path — check the project's files first.`,
+      action: `fixing the import of ${m[1]}`,
+    }),
+  },
+  {
+    match: /Cannot find module '([^.'][^']*)'|Could not resolve "([^."][^"]*)"/,
     diagnose: (m) => ({
       cause: `"${m[1] ?? m[2]}" is not installed. If it is a real npm package, add it as a dependency; if it isn't, it was made up — use something already in package.json.`,
       action: `fixing the missing "${m[1] ?? m[2]}"`,
+    }),
+  },
+  {
+    match: /Package "(.+?)" does not exist on npm/,
+    diagnose: (m) => ({
+      cause: `"${m[1]}" is not a real npm package — it was made up. Use a package already in package.json, or write the code without it.`,
+      action: `replacing the made-up package ${m[1]}`,
+    }),
+  },
+  // TypeScript (the typecheck gate). These catch the same bugs as the runtime
+  // entries below, before anything runs.
+  {
+    match: /TS2724: .+? has no exported member named '(.+?)'\. Did you mean '(.+?)'/,
+    diagnose: (m) => ({
+      cause: `"${m[1]}" is not exported there — probably a typo for "${m[2]}".`,
+      action: `fixing the import of ${m[1]}`,
+    }),
+  },
+  {
+    match: /TS1804[78]: '(.+?)' is possibly '(?:undefined|null)'/,
+    diagnose: (m) => ({
+      cause: `"${m[1]}" may not exist yet — usually data that has not loaded — but it is used directly. It needs a guard or optional chaining.`,
+      action: `guarding "${m[1]}" before it is used`,
+    }),
+  },
+  {
+    match: /TS2304: Cannot find name '(.+?)'/,
+    diagnose: (m) => ({
+      cause: `"${m[1]}" is used but never imported or declared in that file — the import is missing.`,
+      action: `adding the missing import for ${m[1]}`,
+    }),
+  },
+  {
+    match: /TS2305: Module '(.+?)' has no exported member '(.+?)'/,
+    diagnose: (m) => ({
+      cause: `${m[1]} does not export "${m[2]}" — a typo, or a default vs named export mix-up.`,
+      action: `fixing the import of ${m[2]}`,
+    }),
+  },
+  {
+    match: /TS2339: Property '(.+?)' does not exist on type/,
+    diagnose: (m) => ({
+      cause: `The code reads "${m[1]}", which that value does not have — a typo, or the data has a different shape.`,
+      action: `fixing the use of ${m[1]}`,
+    }),
+  },
+  {
+    match: /TS(?:2322|2345): /,
+    diagnose: () => ({
+      cause: 'A value of the wrong type is passed or assigned — the types of the code and the data disagree.',
+      action: 'fixing a type mismatch',
     }),
   },
   {
@@ -174,19 +232,21 @@ export function buildFixPrompt(
   files: { path: string; content: string }[],
   opts: { stuck: boolean },
 ): string {
+  // Type errors come as one list (in `stack`) and get one repair round between them.
+  const typeErrors = e.type === 'TYPE_ERROR';
   const parts = [
-    'The app failed with the following error. Fix it.',
+    typeErrors ? 'The type check (tsc) found errors in the code. Fix them.' : 'The app failed with the following error. Fix it.',
     '',
     `ERROR TYPE: ${e.type}`,
     `MESSAGE: ${e.message}`,
     e.componentStack && `COMPONENT STACK:\n${e.componentStack}`,
-    e.stack && `STACK (repo-relative):\n${e.stack}`,
+    e.stack && `${typeErrors ? 'ALL TYPE ERRORS' : 'STACK (repo-relative)'}:\n${e.stack}`,
     e.frame && `CODE FRAME:\n${e.frame}`,
     `LIKELY CAUSE: ${d.cause}`,
     opts.stuck && 'NOTE: The previous fix did not remove this error, so that approach is wrong. Try a different one.',
     files.length > 0 && ['', 'RELEVANT FILES:', ...files.map((f) => `--- ${f.path} ---\n${f.content}`)].join('\n'),
     '',
-    'Fix ONLY this error. Do not refactor anything else.',
+    typeErrors ? 'Fix ONLY these errors. Do not refactor anything else.' : 'Fix ONLY this error. Do not refactor anything else.',
   ];
   return parts.filter((p): p is string => typeof p === 'string').join('\n');
 }

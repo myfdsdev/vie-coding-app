@@ -1,9 +1,10 @@
+import path from 'node:path';
 import type { ModelRequest } from './providers';
 
 /**
  * Canned model output for PROVIDER=mock. It exercises the real pipeline —
- * streaming parse, file writes, edits, checkpoints, sandbox sync, preview and
- * the repair loop — with no API key.
+ * streaming parse, stream fixer, file writes, edits, validation gates,
+ * checkpoints, sandbox sync, preview and the repair loop — with no API key.
  *
  * - A first build request: a small task app, titled from the user's words.
  * - A follow-up request: one demo change sent as an <edit> (the header badge
@@ -12,11 +13,21 @@ import type { ModelRequest } from './providers';
  *   recipe list that crashes on its first render, and a real fix when the
  *   repair loop asks. With "unfixable" in the request, the fixes never work,
  *   which exercises the repair budget.
+ * - A request for a "dashboard" or "invoices": an invoice dashboard written
+ *   with the mistakes models really make — an invented icon, an "@/" import,
+ *   an import one folder off, an undeclared package and a made-up one. The
+ *   stream fixer and the gates correct all five with no second model call.
+ *   With "sidebar" it also imports a component it never writes, which only
+ *   the model can fix: one more pass creates it.
+ * - A request to hard-code a key: code containing one, which the secrets gate
+ *   stops.
  */
 export function mockResponse(req: ModelRequest): string {
   const last = req.messages[req.messages.length - 1]?.content ?? '';
-  if (last.includes('The app failed with the following error.')) return recipeRepair(req.context, last);
+  if (/^ERROR TYPE: /m.test(last)) return repair(req.context, last);
+  if (SECRET_REQUEST.test(last)) return paymentsWithKey();
   if (BREAKING_REQUEST.test(last)) return recipeApp(/unfixable/i.test(last));
+  if (DASHBOARD_REQUEST.test(last)) return dashboardApp(/sidebar/i.test(last));
   if (req.context.includes('src/hooks/useTasks.ts')) {
     const color: Badge = req.context.includes(`rounded-xl ${BADGE.rose}`) ? 'indigo' : 'rose';
     return /could not be placed exactly/.test(last) ? headerRewrite(color) : headerEdit(color);
@@ -25,7 +36,17 @@ export function mockResponse(req: ModelRequest): string {
 }
 
 const BREAKING_REQUEST = /data\.map|before the (?:fetch|data)|unfixable/i;
+const DASHBOARD_REQUEST = /dashboard|invoice/i;
+const SECRET_REQUEST = /hard-?cod(?:e|ed|ing)\b[^.]*\bkey\b/i;
 const UNFIXABLE_MARK = '// forge-mock: unfixable';
+
+/** A fix prompt (diagnose.ts buildFixPrompt): repair the demo failures it knows. */
+function repair(context: string, prompt: string): string {
+  const missing = prompt.match(/Failed to resolve import "(.+?)" from "(.+?)"/);
+  if (missing) return createMissing(missing[1], missing[2]);
+  if (/reading 'map'/.test(prompt)) return recipeRepair(context);
+  return "I'm the offline mock model: I can only repair the demo crashes.";
+}
 
 const RECIPES_LIB = `export interface Recipe {
   id: string;
@@ -125,8 +146,7 @@ ${recipeHome('broken', unfixable)}
 Your recipes now show as cards with their cook times.`;
 }
 
-function recipeRepair(context: string, prompt: string): string {
-  if (!/reading 'map'/.test(prompt)) return "I'm the offline mock model: I can only repair the demo recipe crash.";
+function recipeRepair(context: string): string {
   const unfixable = context.includes(UNFIXABLE_MARK);
   return `${unfixable ? 'Telling TypeScript the data is there before the list renders.' : 'Adding a loading state so the list waits for the data.'}
 
@@ -137,6 +157,252 @@ ${recipeHome(unfixable ? 'stubborn' : 'guarded', unfixable)}
 </changes>
 
 ${unfixable ? 'The list renders the data directly.' : 'The recipes page shows a loading message until the data arrives.'}`;
+}
+
+// ---------------------------------------------------------------------------
+// Invoice dashboard (M3). Each file carries one of the mistakes models make.
+// ---------------------------------------------------------------------------
+
+const INVOICES_LIB = `export type InvoiceStatus = 'paid' | 'open' | 'overdue';
+
+export interface Invoice {
+  id: string;
+  client: string;
+  amount: number;
+  due: string;
+  status: InvoiceStatus;
+}
+
+export const INVOICES: Invoice[] = [
+  { id: 'INV-1042', client: 'Northwind Studio', amount: 4200, due: '2026-09-02', status: 'paid' },
+  { id: 'INV-1043', client: 'Kestrel & Co', amount: 1850, due: '2026-09-18', status: 'open' },
+  { id: 'INV-1044', client: 'Blue Harbor Cafe', amount: 640, due: '2026-08-28', status: 'overdue' },
+  { id: 'INV-1045', client: 'Aster Health', amount: 9300, due: '2026-09-30', status: 'open' },
+  { id: 'INV-1046', client: 'Lumen Books', amount: 1275, due: '2026-09-05', status: 'paid' },
+];`;
+
+// Mistake: date-fns is a real package, but it is not in package.json.
+const FORMAT_LIB = `import { format } from 'date-fns';
+
+export function formatMoney(amount: number): string {
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(amount);
+}
+
+export function formatDate(iso: string): string {
+  return format(new Date(iso), 'd MMM yyyy');
+}`;
+
+const STATUS_BADGE = `import type { InvoiceStatus } from '../lib/invoices';
+
+const STYLES: Record<InvoiceStatus, string> = {
+  paid: 'bg-emerald-50 text-emerald-700 ring-emerald-200',
+  open: 'bg-sky-50 text-sky-700 ring-sky-200',
+  overdue: 'bg-rose-50 text-rose-700 ring-rose-200',
+};
+
+export function StatusBadge({ status }: { status: InvoiceStatus }) {
+  return (
+    <span className={'inline-flex rounded-full px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset ' + STYLES[status]}>
+      {status}
+    </span>
+  );
+}`;
+
+// Mistake: "./lib/format" from src/components — one folder off.
+const INVOICE_TABLE = `import type { Invoice } from '../lib/invoices';
+import { formatDate, formatMoney } from './lib/format';
+import { StatusBadge } from './StatusBadge';
+
+export function InvoiceTable({ invoices }: { invoices: Invoice[] }) {
+  return (
+    <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+      <table className="w-full text-left text-sm">
+        <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+          <tr>
+            <th className="px-4 py-2.5 font-medium">Invoice</th>
+            <th className="px-4 py-2.5 font-medium">Client</th>
+            <th className="px-4 py-2.5 font-medium">Due</th>
+            <th className="px-4 py-2.5 text-right font-medium">Amount</th>
+            <th className="px-4 py-2.5 font-medium">Status</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {invoices.map((invoice) => (
+            <tr key={invoice.id} className="text-slate-700">
+              <td className="px-4 py-3 font-mono text-xs text-slate-500">{invoice.id}</td>
+              <td className="px-4 py-3 font-medium text-slate-900">{invoice.client}</td>
+              <td className="px-4 py-3">{formatDate(invoice.due)}</td>
+              <td className="px-4 py-3 text-right tabular-nums">{formatMoney(invoice.amount)}</td>
+              <td className="px-4 py-3">
+                <StatusBadge status={invoice.status} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}`;
+
+// Mistake: "lucide-react-icons" does not exist on npm; every name imported from it is a real lucide icon.
+const STAT_CARD = `import { ArrowUpRight, TriangleAlert } from 'lucide-react-icons';
+
+interface StatCardProps {
+  label: string;
+  value: string;
+  hint: string;
+  tone?: 'default' | 'alert';
+}
+
+export function StatCard({ label, value, hint, tone = 'default' }: StatCardProps) {
+  const Icon = tone === 'alert' ? TriangleAlert : ArrowUpRight;
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</p>
+      <p className={'mt-2 text-2xl font-semibold ' + (tone === 'alert' ? 'text-rose-600' : 'text-slate-900')}>{value}</p>
+      <p className="mt-1 flex items-center gap-1 text-xs text-slate-500">
+        <Icon size={13} />
+        {hint}
+      </p>
+    </div>
+  );
+}`;
+
+const SIDEBAR = `import { FileText, LayoutDashboard, Settings, Users } from 'lucide-react';
+
+const LINKS = [
+  { label: 'Overview', icon: LayoutDashboard, active: true },
+  { label: 'Invoices', icon: FileText, active: false },
+  { label: 'Clients', icon: Users, active: false },
+  { label: 'Settings', icon: Settings, active: false },
+];
+
+export function Sidebar() {
+  return (
+    <aside className="hidden w-52 shrink-0 flex-col gap-1 border-r border-slate-200 bg-white p-4 sm:flex">
+      <p className="px-2 pb-3 text-sm font-semibold text-slate-900">Ledgerly</p>
+      {LINKS.map(({ label, icon: Icon, active }) => (
+        <a
+          key={label}
+          href="#"
+          className={'flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm ' + (active ? 'bg-slate-100 font-medium text-slate-900' : 'text-slate-500 hover:text-slate-800')}
+        >
+          <Icon size={15} />
+          {label}
+        </a>
+      ))}
+    </aside>
+  );
+}`;
+
+// Mistakes: "LayoutDashbaord" is not an icon, and "@/" has no alias in the template's Vite config.
+function dashboardHome(sidebar: boolean): string {
+  return `import { LayoutDashbaord, Plus } from 'lucide-react';
+import { InvoiceTable } from '@/components/InvoiceTable';
+${sidebar ? "import { Sidebar } from '../components/Sidebar';\n" : ''}import { StatCard } from '../components/StatCard';
+import { formatMoney } from '../lib/format';
+import { INVOICES, type Invoice } from '../lib/invoices';
+
+const total = (list: Invoice[]) => list.reduce((sum, invoice) => sum + invoice.amount, 0);
+
+export default function Home() {
+  const open = INVOICES.filter((i) => i.status !== 'paid');
+  const paid = INVOICES.filter((i) => i.status === 'paid');
+  const overdue = INVOICES.filter((i) => i.status === 'overdue');
+  console.log('[invoices] render', INVOICES.length, 'invoices');
+
+  return (
+    <div className="flex min-h-screen bg-slate-50">
+${sidebar ? '      <Sidebar />\n' : ''}      <main className="flex-1 px-6 py-10">
+        <div className="mx-auto flex max-w-4xl flex-col gap-6">
+          <header className="flex items-center gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white">
+              <LayoutDashbaord size={20} />
+            </span>
+            <div className="min-w-0 flex-1">
+              <h1 className="text-xl font-semibold tracking-tight text-slate-900">Invoices</h1>
+              <p className="text-sm text-slate-500">What is owed, what is paid and what is late.</p>
+            </div>
+            <button className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-slate-700">
+              <Plus size={15} />
+              New invoice
+            </button>
+          </header>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <StatCard label="Outstanding" value={formatMoney(total(open))} hint={open.length + ' open invoices'} />
+            <StatCard label="Paid" value={formatMoney(total(paid))} hint={paid.length + ' settled this month'} />
+            <StatCard label="Overdue" value={formatMoney(total(overdue))} hint={overdue.length + ' past the due date'} tone="alert" />
+          </div>
+          <InvoiceTable invoices={INVOICES} />
+        </div>
+      </main>
+    </div>
+  );
+}`;
+}
+
+function dashboardApp(sidebar: boolean): string {
+  return `I'll build an invoice dashboard: totals for what is outstanding, paid and overdue at the top, and every invoice with its status below.
+
+<changes>
+<write path="src/pages/Home.tsx">
+${dashboardHome(sidebar)}
+</write>
+<write path="src/components/InvoiceTable.tsx">
+${INVOICE_TABLE}
+</write>
+<write path="src/components/StatusBadge.tsx">
+${STATUS_BADGE}
+</write>
+<write path="src/components/StatCard.tsx">
+${STAT_CARD}
+</write>
+<write path="src/lib/format.ts">
+${FORMAT_LIB}
+</write>
+<write path="src/lib/invoices.ts">
+${INVOICES_LIB}
+</write>
+</changes>
+
+Your invoice dashboard is ready — totals at the top, every invoice below.`;
+}
+
+/** The repair for "Failed to resolve import": write the file that was imported but never created. */
+function createMissing(spec: string, from: string): string {
+  const target = path.posix.normalize(path.posix.join(path.posix.dirname(from), spec)) + '.tsx';
+  const name = path.posix.basename(spec).replace(/[^A-Za-z0-9]/g, '') || 'Section';
+  const content =
+    name === 'Sidebar'
+      ? SIDEBAR
+      : `export function ${name}() {\n  return <section className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-500">${name}</section>;\n}`;
+  return `${target} was imported but never written — adding it.
+
+<changes>
+<write path="${target}">
+${content}
+</write>
+</changes>
+
+Added the missing ${name}.`;
+}
+
+/** Code with a key in it, for the secrets gate. Built at runtime so no key-shaped string sits in this source. */
+function paymentsWithKey(): string {
+  const key = ['sk', 'live', 'forgeDemo' + '0'.repeat(16)].join('_');
+  return `I'll add checkout with your Stripe key.
+
+<changes>
+<write path="src/lib/payments.ts">
+const STRIPE_SECRET_KEY = '${key}';
+
+export async function startCheckout(amount: number): Promise<void> {
+  console.log('[payments] checkout', amount, STRIPE_SECRET_KEY.length);
+}
+</write>
+</changes>
+
+Checkout now uses your Stripe key.`;
 }
 
 /** "build me a recipe tracker for my family" -> "Recipe Tracker" */

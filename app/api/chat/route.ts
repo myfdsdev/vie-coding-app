@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { runTurn } from '@/agent/loop';
 import type { TurnEvent } from '@/agent/types';
+import { redactSecrets, scanForSecrets, secretRefusal } from '@/agent/validate';
 import { appendMessages } from '@/store/chats';
 import { isProjectId } from '@/store/projects';
 import { applyTurnEvent, newAssistantTurn, type UserMessage } from '@/ui/turn-state';
@@ -11,7 +12,7 @@ export const dynamic = 'force-dynamic';
 
 /** A failure the builder page asks Forge to fix ("Fix it"). It came from generated code, so it is capped. */
 const PreviewErrorSchema = z.object({
-  type: z.enum(['BUILD_ERROR', 'REACT_RENDER_ERROR', 'UNCAUGHT_EXCEPTION', 'UNHANDLED_REJECTION', 'BLANK_SCREEN']),
+  type: z.enum(['BUILD_ERROR', 'REACT_RENDER_ERROR', 'UNCAUGHT_EXCEPTION', 'UNHANDLED_REJECTION', 'BLANK_SCREEN', 'TYPE_ERROR']),
   message: z.string().max(1000),
   stack: z.string().max(4000).optional(),
   componentStack: z.string().max(4000).optional(),
@@ -36,6 +37,12 @@ export async function POST(req: Request) {
   }
   const { projectId, message, previewReports, repairOf } = parsed.data;
 
+  // A key pasted into the chat would reach the model, the stored chat and
+  // probably the app's code, where every visitor can read it. Refuse it
+  // before any of that happens; nothing is stored.
+  const secrets = scanForSecrets(message);
+  if (secrets.length) return Response.json({ error: secretRefusal(secrets), redacted: redactSecrets(message) }, { status: 422 });
+
   const abort = new AbortController();
   req.signal.addEventListener('abort', () => abort.abort());
   const encoder = new TextEncoder();
@@ -58,7 +65,8 @@ export async function POST(req: Request) {
       };
       await runTurn({ projectId, message, emit, signal: abort.signal, previewReports, repairOf });
       try {
-        appendMessages(projectId, [user, turn]);
+        // The model's own words are stored too; never with a key in them.
+        appendMessages(projectId, [user, { ...turn, plan: redactSecrets(turn.plan), summary: redactSecrets(turn.summary) }]);
       } catch (err) {
         console.error('[forge] could not save the chat', err);
       }

@@ -1,9 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import { AlertCircle, Box, Check, Package, X } from 'lucide-react';
+import { AlertCircle, Box, Check, ChevronDown, Package, ShieldCheck, TriangleAlert, Wrench, X } from 'lucide-react';
 import { Prose } from './Prose';
-import type { AssistantTurn, FileRow, RepairRow } from './turn-state';
+import type { AssistantTurn, CheckRow, FileRow, RepairRow } from './turn-state';
 
 const fmt = (n: number) => n.toLocaleString('en-US');
 const credits = (n: number) => (n < 10 ? n.toFixed(1) : fmt(Math.round(n)));
@@ -27,12 +27,80 @@ function FileLine({ file }: { file: FileRow }) {
   );
 }
 
+const GATE_LABEL: Record<CheckRow['gate'], string> = {
+  'stream-fix': 'Known AI mistakes',
+  secrets: 'No keys in app code',
+  packages: 'Packages are real',
+  'package-json': 'Dependencies listed',
+  imports: 'Imports resolve',
+  providers: 'App providers',
+  typecheck: 'Type check',
+};
+
+function CheckLine({ check }: { check: CheckRow }) {
+  const icon = {
+    pass: <Check size={12} strokeWidth={2.5} className="mt-[2px] shrink-0 text-ok" />,
+    fixed: <Wrench size={12} className="mt-[2px] shrink-0 text-accent" />,
+    fail: <X size={12} strokeWidth={2.5} className="mt-[2px] shrink-0 text-err" />,
+    warn: <TriangleAlert size={12} className="mt-[2px] shrink-0 text-[#d8c39c]" />,
+  }[check.status];
+  // File names are enough here; the server log keeps the full paths.
+  const parts = check.detail.replace(/\bsrc\/(?:[\w.-]+\/)*/g, '').split('; ');
+  return (
+    <div className="flex items-start gap-2 px-3 py-[6px]">
+      {icon}
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="text-[11.5px] leading-[1.45] text-text-2">{GATE_LABEL[check.gate]}</span>
+        {parts.map((part, i) => (
+          <span key={i} className="break-words font-mono text-[10.5px] leading-[1.55] text-dim">
+            {part}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** What was checked (and corrected) before the change reached the preview; passing rows stay folded away. */
+function ChecksCard({ checks }: { checks: CheckRow[] }) {
+  const [open, setOpen] = useState(false);
+  const count = (s: CheckRow['status']) => checks.filter((c) => c.status === s).length;
+  const summary = [
+    count('pass') && `${count('pass')} passed`,
+    count('fixed') && `${count('fixed')} fixed`,
+    count('warn') && `${count('warn')} to note`,
+    count('fail') && `${count('fail')} failed`,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  const shown = open ? checks : checks.filter((c) => c.status !== 'pass');
+  return (
+    <div className="overflow-hidden rounded-[9px] border border-line bg-panel-2">
+      <button onClick={() => setOpen((o) => !o)} className="flex w-full items-center gap-2 px-3 py-[9px] text-left">
+        <ShieldCheck size={12} className={count('fail') ? 'text-err' : 'text-ok'} />
+        <span className="text-[11px] font-semibold uppercase tracking-[0.04em] text-dim">Checked before running</span>
+        <span className="flex-1" />
+        <span className="font-mono text-[10.5px] text-dim-2">{summary}</span>
+        <ChevronDown size={12} className={'text-dim-2 transition ' + (open ? 'rotate-180' : '')} />
+      </button>
+      {shown.length > 0 && (
+        <div className="flex flex-col border-t border-line py-1">
+          {shown.map((c) => (
+            <CheckLine key={c.gate} check={c} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const TITLE: Record<RepairRow['error']['type'], string> = {
   BUILD_ERROR: 'Build error caught',
   REACT_RENDER_ERROR: 'Runtime error caught',
   UNCAUGHT_EXCEPTION: 'Runtime error caught',
   UNHANDLED_REJECTION: 'Runtime error caught',
   BLANK_SCREEN: 'Blank screen caught',
+  TYPE_ERROR: 'Type error caught',
 };
 
 /** Consecutive rounds on the same failure share one error card; its fixing card shows the latest attempt. */
@@ -52,6 +120,7 @@ function RepairCard({ rows, onStop }: { rows: RepairRow[]; onStop?: () => void }
   const first = rows[0];
   const latest = rows[rows.length - 1];
   const e = first.error;
+  const title = e.prerun ? 'Caught before running' : TITLE[e.type];
   const where = e.file ? `${e.file.split('/').pop()}${e.line ? `:${e.line}` : ''}` : null;
   // Stack traces live behind a disclosure; the diagnosis is what the user reads.
   const details = [e.componentStack && `Component stack:\n${e.componentStack}`, e.stack && `Stack:\n${e.stack}`, e.frame].filter(Boolean).join('\n\n');
@@ -62,7 +131,7 @@ function RepairCard({ rows, onStop }: { rows: RepairRow[]; onStop?: () => void }
       <div className="overflow-hidden rounded-[10px] border border-[#4a2a28] bg-[#1e1615]">
         <div className="flex items-center gap-2 border-b border-[#3a2321] bg-[#251817] px-3 py-2.5">
           <AlertCircle size={14} className="text-err" />
-          <span className="text-[11px] font-semibold uppercase tracking-[0.04em] text-err">{TITLE[e.type]}</span>
+          <span className="text-[11px] font-semibold uppercase tracking-[0.04em] text-err">{title}</span>
           <span className="flex-1" />
           {where && <span className="font-mono text-[10.5px] text-[#8b6360]">{where}</span>}
         </div>
@@ -202,7 +271,10 @@ export function AssistantMessage({ turn, onStop, onRollback }: AssistantMessageP
         </div>
       ))}
 
-      {turn.summary.trim() && <Prose text={turn.summary.trim()} className="leading-relaxed text-text" />}
+      {turn.checks && turn.checks.length > 0 && <ChecksCard checks={turn.checks} />}
+
+      {/* The model's closing sentence claims the change is done; on a failed turn it is not. */}
+      {turn.summary.trim() && turn.status !== 'failed' && <Prose text={turn.summary.trim()} className="leading-relaxed text-text" />}
 
       {groupRepairs(repairs).map((rows) => (
         <RepairCard key={rows[0].round} rows={rows} onStop={turn.status === 'streaming' ? onStop : undefined} />

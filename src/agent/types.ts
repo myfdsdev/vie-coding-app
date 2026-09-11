@@ -1,5 +1,6 @@
 import type { PreviewError } from '../preview/events';
 import type { SandboxStatus } from '../sandbox/types';
+import type { GateResult } from './validate';
 
 /** Stages of runTurn (BUILD-PROMPT §7). Only the ones a milestone implements are emitted. */
 export type TurnStage =
@@ -32,8 +33,13 @@ export type TurnEvent =
    * counted from now rather than from the attempt's change.
    */
   | { type: 'collect'; turnId: string; attempt: number; check: number; windowMs: number; remounted: boolean; fresh?: boolean }
-  /** What checking the preview found after an attempt; empty means it works. */
-  | { type: 'check'; attempt: number; errors: PreviewError[] }
+  /** A pre-execution gate (§9a/§9b) or the typecheck ran: one per gate per attempt, also logged on the server. */
+  | ({ type: 'gate'; attempt: number } & GateResult)
+  /**
+   * What checking the preview found after an attempt; empty means it works.
+   * `typeErrors`: type errors left in a working app, which never fail a turn.
+   */
+  | { type: 'check'; attempt: number; errors: PreviewError[]; typeErrors?: number }
   /** A repair attempt starts: "Attempt 2 of 3 — adding a loading guard". */
   | {
       type: 'repair';

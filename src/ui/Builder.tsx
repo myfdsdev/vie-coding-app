@@ -146,7 +146,8 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
   const send = useCallback(
     async (text: string, repairOf?: PreviewError) => {
       const turnId = nextId();
-      setMessages((prev) => [...prev, { id: nextId(), role: 'user', text }, newAssistantTurn(turnId)]);
+      const userId = nextId();
+      setMessages((prev) => [...prev, { id: userId, role: 'user', text }, newAssistantTurn(turnId)]);
       setMarks({});
       setIdleErrors([]);
       setBusy(true);
@@ -160,7 +161,13 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
           body: JSON.stringify({ projectId, message: text, previewReports: true, repairOf }),
           signal: abort.signal,
         });
-        if (!res.ok || !res.body) throw new Error(`Request failed (${res.status})`);
+        if (!res.ok || !res.body) {
+          const data = (await res.json().catch(() => ({}))) as { error?: string; redacted?: string };
+          // A message refused for containing a key must not stay on screen with the key in it.
+          const redacted = data.redacted;
+          if (redacted !== undefined) setMessages((prev) => prev.map((m) => (m.id === userId && m.role === 'user' ? { ...m, text: redacted } : m)));
+          throw new Error(data.error ?? `Request failed (${res.status})`);
+        }
         for await (const event of readTurnEvents(res.body)) {
           updateTurn(turnId, (t) => applyTurnEvent(t, event));
           switch (event.type) {

@@ -1,13 +1,16 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { dedupeErrors, toPreviewError, type PreviewError } from '../preview/events';
 import { waitForReport } from '../preview/reports';
 import { ensureSandbox, waitForReady } from '../sandbox';
 import type { Sandbox } from '../sandbox/types';
 import { appendHistory, getHistory, takePendingNote } from '../store/chats';
-import { checkpoint, ensureRepo, listVersions } from '../store/checkpoints';
+import { checkpoint, discardChanges, ensureRepo, listVersions } from '../store/checkpoints';
 import { recordUsage, settleTurn, type LedgerKind } from '../store/meter';
 import {
   PROTECTED_PATHS,
+  TEMPLATE_DIR,
   deleteProjectFile,
   ensureProject,
   ensureWorkspace,
@@ -26,19 +29,31 @@ import { buildFixPrompt, diagnoseError, referencedFiles } from './diagnose';
 import { ChangesParser, type ChangeOp, type ParseEvent } from './parser';
 import { SYSTEM_PROMPT } from './prompt';
 import { getProvider, type ModelMessage, type ModelProvider, type ModelUsage } from './providers';
+import { fixSource, type SourceFix } from './stream-fixer';
 import type { FileChange, TurnEvent } from './types';
+import {
+  TYPECHECK_COMMAND,
+  npmRegistry,
+  parseTypeErrors,
+  redactSecrets,
+  validateProject,
+  type GateResult,
+  type Registry,
+  type TypeErrorLine,
+} from './validate';
 
 /**
- * The agent turn (BUILD-PROMPT §7), M2 scope.
+ * The agent turn (BUILD-PROMPT §7), M3 scope.
  *
- *   2 CONTEXT, then per attempt: 3 PLAN+EMIT, 5 APPLY, 7 CHECKPOINT,
- *   8 EXECUTE, 9 COLLECT, 10 DECIDE; finally 11 METER.
+ *   2 CONTEXT, then per attempt: 3 PLAN+EMIT, 4 STREAM FIX, 5 APPLY,
+ *   6 VALIDATE, 7 CHECKPOINT, 8 EXECUTE, 9 COLLECT, 10 DECIDE; finally 11 METER.
  *
- * DECIDE is deterministic: a clean check ends the turn, and LoopBudget — never
- * the model — ends a failing one. Repairs and retries are recorded but never
+ * VALIDATE fixes what deterministic code can fix and sends the rest back to
+ * the model without the sandbox ever seeing the change. DECIDE is
+ * deterministic too: a clean check ends the turn, and LoopBudget — never the
+ * model — ends a failing one. Repairs and retries are recorded but never
  * billed; the build is billed only when the turn ends with a working preview.
- * ROUTE, STREAM FIX and VALIDATE arrive in M3 at the positions their numbers
- * indicate.
+ * ROUTE (stage 1) arrives with plan mode.
  */
 
 export interface TurnInput {
@@ -50,6 +65,8 @@ export interface TurnInput {
   previewReports?: boolean;
   /** "Fix it" from the preview: repair this failure instead of building from the message. */
   repairOf?: PreviewError;
+  /** Where package names are checked; tests pass a fake. */
+  registry?: Registry;
 }
 
 interface Applied {
@@ -59,6 +76,8 @@ interface Applied {
   touched: string[];
   /** <edit>s apply-edit.ts could not place; they are asked for again as whole files. */
   failedEdits: { path: string; reason: string }[];
+  /** What the stream fixer corrected on the way in. */
+  fixes: ({ path: string } & SourceFix)[];
 }
 
 /** One model call and the file operations it produced. */
@@ -73,11 +92,15 @@ interface Pass {
 
 type Outcome = 'success' | 'failed' | 'stopped' | 'answered';
 
+/** The turn wrote a key into app code; its changes were discarded. */
+class SecretInCode extends Error {}
+
 export async function runTurn(input: TurnInput): Promise<void> {
   const { projectId, message, emit, signal } = input;
   const started = Date.now();
   const turnId = randomUUID();
   const provider = getProvider();
+  const registry = input.registry ?? npmRegistry;
   const budget = new LoopBudget();
   emit({ type: 'turn-start', turnId, provider: provider.name, model: provider.modelFor('code') });
 
@@ -86,7 +109,23 @@ export async function runTurn(input: TurnInput): Promise<void> {
   let outcome: Outcome = 'failed';
   let record: { user: string; response: string; problem?: string } | null = null;
   let errors: PreviewError[] = input.repairOf ? [input.repairOf] : [];
+  // Type errors in an app that runs: one repair round per turn, never a failure.
+  let typeErrors: TypeErrorLine[] = [];
+  let typeRepairUsed = false;
+  let typeGate: GateResult['status'] | undefined;
   let rounds = 0;
+  // Whether this turn has saved a version yet; the first one is the turn's own.
+  let committed = false;
+  // Changes VALIDATE sent back to the model: saved to disk, not yet in the
+  // sandbox. They go in with the attempt that passes.
+  let held: Applied | null = null;
+
+  /** A gate result: a server log line and a row in the chat. */
+  const report = (attempt: number, r: GateResult) => {
+    console.log(`[forge] turn ${turnId.slice(0, 8)} gate ${r.gate}: ${r.status} — ${r.detail}`);
+    if (r.gate === 'typecheck') typeGate = r.status;
+    emit({ type: 'gate', attempt, ...r });
+  };
 
   /** Start a repair round for a failure: count it, show it, return the label for its model call. */
   const startRepair = (error: PreviewError): string => {
@@ -94,9 +133,10 @@ export async function runTurn(input: TurnInput): Promise<void> {
     rounds++;
     const d = diagnoseError(error);
     const attempt = budget.attempts(error);
+    const of = error.type === 'TYPE_ERROR' ? 1 : budget.maxPerSignature;
     const stuck = budget.isStuck(error);
-    emit({ type: 'repair', round: rounds, attempt, of: budget.maxPerSignature, signature: budget.signature(error), cause: d.cause, action: d.action, stuck, error });
-    return `Attempt ${attempt} of ${budget.maxPerSignature} — ${d.action}`;
+    emit({ type: 'repair', round: rounds, attempt, of, signature: budget.signature(error), cause: d.cause, action: d.action, stuck, error });
+    return `Attempt ${attempt} of ${of} — ${d.action}`;
   };
 
   try {
@@ -113,6 +153,8 @@ export async function runTurn(input: TurnInput): Promise<void> {
 
     // Boot (or resume) the sandbox now, in parallel with the model call —
     // the user should never wait for a cold start after the code is written.
+    // It starts from the project as it is now; this turn's files are pushed
+    // only once VALIDATE has passed them.
     const sandboxPromise = ensureSandbox(projectId);
     sandboxPromise.catch(() => undefined); // observed below; avoid an unhandled rejection meanwhile
     // Whether a dev server was already serving before this turn, so the open
@@ -139,8 +181,8 @@ export async function runTurn(input: TurnInput): Promise<void> {
     for (let attempt = 0; ; attempt++) {
       const repairing = attempt > 0 || !!input.repairOf;
 
-      // 3 PLAN+EMIT and 5 APPLY
-      const pass = await modelPass({ projectId, provider, conversation, emit, signal, label });
+      // 3 PLAN+EMIT, 4 STREAM FIX and 5 APPLY
+      const pass = await modelPass({ projectId, provider, conversation, emit, signal, label, registry });
       calls.push({ kind: repairing ? 'repair' : 'build', attempt, model: pass.model, usage: pass.usage });
       let applied = pass.applied;
       const problems = [...pass.problems];
@@ -152,6 +194,7 @@ export async function runTurn(input: TurnInput): Promise<void> {
           provider,
           emit,
           signal,
+          registry,
           conversation: [...conversation, { role: 'assistant', content: pass.response }, { role: 'user', content: wholeFilePrompt(applied.failedEdits) }],
           label: `Rewriting ${applied.failedEdits.map((f) => f.path).join(', ')} in full`,
         });
@@ -179,48 +222,85 @@ export async function runTurn(input: TurnInput): Promise<void> {
       }
 
       if (applied.touched.length) {
-        // 7 CHECKPOINT — a git commit before the sandbox ever sees the change
-        emit({ type: 'stage', stage: 'checkpoint' });
-        try {
-          const version = await checkpoint(
-            projectId,
-            repairing ? { subject: `Fix: ${errors[0]?.message ?? 'preview error'}`, kind: 'repair', turnId } : { subject: message, kind: 'turn', turnId },
-          );
-          if (version) emit({ type: 'checkpoint', version: version.number, sha: version.sha, subject: version.subject });
-        } catch (err) {
-          emit({ type: 'warning', message: `This change was not saved as a version: ${(err as Error).message}` });
+        report(
+          attempt,
+          applied.fixes.length
+            ? { gate: 'stream-fix', status: 'fixed', detail: applied.fixes.map((f) => `${f.path}: ${f.detail}`).join('; ') }
+            : { gate: 'stream-fix', status: 'pass', detail: 'nothing to correct' },
+        );
+
+        // 6 VALIDATE — the §9b gates. What they cannot fix goes back to the
+        // model with a diagnosis (DECIDE below); the sandbox never sees it.
+        const blocked = await validate({ projectId, attempt, applied, registry, emit, report });
+        if (blocked.length) {
+          held = held ? mergeApplied(held, applied) : applied;
+          errors = blocked;
+          typeErrors = [];
+        } else {
+          if (held) {
+            applied = mergeApplied(held, applied);
+            held = null;
+          }
+          // 7 CHECKPOINT — a git commit before the sandbox ever sees the change
+          emit({ type: 'stage', stage: 'checkpoint' });
+          try {
+            const version = await checkpoint(
+              projectId,
+              input.repairOf || committed ? { subject: `Fix: ${errors[0]?.message ?? 'preview error'}`, kind: 'repair', turnId } : { subject: message, kind: 'turn', turnId },
+            );
+            if (version) {
+              committed = true;
+              emit({ type: 'checkpoint', version: version.number, sha: version.sha, subject: version.subject });
+            }
+          } catch (err) {
+            emit({ type: 'warning', message: `This change was not saved as a version: ${(err as Error).message}` });
+          }
+
+          // 8 EXECUTE — push the change into the sandbox and wait for the dev server
+          emit({ type: 'stage', stage: 'execute' });
+          const sandbox = await sandboxPromise;
+          wasServing ??= await servingBefore;
+          // The preview pane unmounts the iframe while the sandbox is not ready, so
+          // announcing a start for a server that is already serving would reload
+          // the preview mid-write — the same race needsPreviewRemount() avoids.
+          if (!wasServing && attempt === 0) emit({ type: 'sandbox', status: 'starting', detail: 'Starting the sandbox' });
+          await syncToSandbox(sandbox, applied, emit);
+          const status = await waitForReady(sandbox, 90_000);
+          // 'ready' can mount the iframe for the first time and a remount may
+          // follow it. Neither may load before Vite's polling watcher has
+          // invalidated the files just written, or the page gets their previous
+          // version from Vite's cache.
+          if (status === 'ready') await new Promise((r) => setTimeout(r, WATCHER_SETTLE_MS));
+          emit({ type: 'sandbox', status, previewUrl: sandbox.previewUrl(), detail: status === 'ready' ? 'Preview ready' : `Sandbox ${status}` });
+          if (status !== 'ready') throw new Error(`The sandbox did not become ready (${status}).`);
+          // A repair is verified on a fresh page load: an error boundary that caught
+          // the old crash would otherwise keep showing it.
+          const remount = repairing || needsPreviewRemount({ filesChanged: true, wasServing, dependenciesChanged: applied.dependenciesChanged });
+          if (remount) emit({ type: 'preview-reload' });
+
+          // 9 COLLECT
+          const found = await collect({ sandbox, turnId, attempt, applied, remounted: remount, emit, signal, previewReports: !!input.previewReports });
+          errors = found.errors;
+          if (found.types) {
+            typeErrors = found.types.errors;
+            report(attempt, typecheckResult(found.types, typeRepairUsed));
+          }
         }
-
-        // 8 EXECUTE — push the change into the sandbox and wait for the dev server
-        emit({ type: 'stage', stage: 'execute' });
-        const sandbox = await sandboxPromise;
-        wasServing ??= await servingBefore;
-        // The preview pane unmounts the iframe while the sandbox is not ready, so
-        // announcing a start for a server that is already serving would reload
-        // the preview mid-write — the same race needsPreviewRemount() avoids.
-        if (!wasServing && attempt === 0) emit({ type: 'sandbox', status: 'starting', detail: 'Starting the sandbox' });
-        await syncToSandbox(sandbox, applied, emit);
-        const status = await waitForReady(sandbox, 90_000);
-        // 'ready' can mount the iframe for the first time and a remount may
-        // follow it. Neither may load before Vite's polling watcher has
-        // invalidated the files just written, or the page gets their previous
-        // version from Vite's cache.
-        if (status === 'ready') await new Promise((r) => setTimeout(r, WATCHER_SETTLE_MS));
-        emit({ type: 'sandbox', status, previewUrl: sandbox.previewUrl(), detail: status === 'ready' ? 'Preview ready' : `Sandbox ${status}` });
-        if (status !== 'ready') throw new Error(`The sandbox did not become ready (${status}).`);
-        // A repair is verified on a fresh page load: an error boundary that caught
-        // the old crash would otherwise keep showing it.
-        const remount = repairing || needsPreviewRemount({ filesChanged: true, wasServing, dependenciesChanged: applied.dependenciesChanged });
-        if (remount) emit({ type: 'preview-reload' });
-
-        // 9 COLLECT
-        errors = await collect({ sandbox, turnId, attempt, applied, remounted: remount, emit, signal, previewReports: !!input.previewReports });
       }
       // A repair that changed nothing leaves the failure as it was.
-      emit({ type: 'check', attempt, errors: errors.slice(0, 3) });
+      emit({ type: 'check', attempt, errors: errors.slice(0, 3), typeErrors: errors.length ? undefined : typeErrors.length || undefined });
 
       // 10 DECIDE
       if (!errors.length) {
+        if (typeErrors.length && !typeRepairUsed) {
+          typeRepairUsed = true;
+          const typeError = typeErrorOf(typeErrors);
+          label = startRepair(typeError);
+          conversation.push({ role: 'user', content: await fixPrompt(projectId, typeError, false) });
+          continue;
+        }
+        // Its one round is used: what is left is a note, and the chat must not still show it failing.
+        if (typeErrors.length && typeGate !== 'warn') report(attempt, typecheckResult({ errors: typeErrors }, true));
         outcome = 'success';
         break;
       }
@@ -236,6 +316,10 @@ export async function runTurn(input: TurnInput): Promise<void> {
   } catch (err) {
     if (signal.aborted) outcome = 'stopped';
     else {
+      if (err instanceof SecretInCode && !committed) {
+        touched.clear();
+        if (record) record.problem = 'it put a secret key into app code, so Forge discarded it';
+      }
       emit({ type: 'error', message: err instanceof Error ? err.message : String(err) });
       outcome = 'failed';
     }
@@ -247,12 +331,12 @@ export async function runTurn(input: TurnInput): Promise<void> {
       rounds === 0
         ? ''
         : outcome === 'success'
-          ? `\n[the preview failed after this change and was repaired automatically in ${rounds} attempt${rounds === 1 ? '' : 's'}]`
+          ? `\n[this change had errors that were repaired automatically in ${rounds} attempt${rounds === 1 ? '' : 's'}]`
           : `\n[the preview still fails: ${errors[0]?.message ?? 'unknown error'} — automatic repair stopped]`;
     try {
       appendHistory(projectId, [
-        { role: 'user', content: record.user },
-        { role: 'assistant', content: historyEntryFor(record.response, [...touched], record.problem) + repairNote },
+        { role: 'user', content: redactSecrets(record.user) },
+        { role: 'assistant', content: redactSecrets(historyEntryFor(record.response, [...touched], record.problem) + repairNote) },
       ]);
     } catch (err) {
       console.error('[forge] could not save the model history', err);
@@ -272,13 +356,72 @@ export async function runTurn(input: TurnInput): Promise<void> {
   emit({ type: 'turn-end', outcome, durationMs: Date.now() - started, filesChanged: touched.size });
 }
 
+let templateMainFile: Promise<string | undefined> | undefined;
+
+/** The starter template's src/main.tsx, which wraps the app in its providers. */
+function templateMain(): Promise<string | undefined> {
+  templateMainFile ??= readFile(path.join(TEMPLATE_DIR, 'src', 'main.tsx'), 'utf8').catch(() => undefined);
+  return templateMainFile;
+}
+
+/**
+ * 6 VALIDATE: the §9b gates on the project as APPLY left it. Their fixes are
+ * written and merged into `applied`; returns the failures only the model can
+ * fix. A key in app code stops the turn and discards its changes.
+ */
+async function validate(o: {
+  projectId: string;
+  attempt: number;
+  applied: Applied;
+  registry: Registry;
+  emit: (e: TurnEvent) => void;
+  report: (attempt: number, r: GateResult) => void;
+}): Promise<PreviewError[]> {
+  o.emit({ type: 'stage', stage: 'validate' });
+  const result = await validateProject({
+    files: await readProjectFiles(o.projectId),
+    written: o.applied.written.map((w) => w.path),
+    registry: o.registry,
+    templateMain: await templateMain(),
+  });
+  for (const r of result.results) o.report(o.attempt, r);
+
+  if (result.secrets.length) {
+    const { removed } = await discardChanges(o.projectId);
+    for (const path of removed) o.emit({ type: 'file', path, status: 'done', change: 'deleted' });
+    const found = result.secrets.map((s) => `${s.path} contained ${s.label}`).join('; ');
+    throw new SecretInCode(
+      `Forge stopped this change before it ran: ${found}. Anything in app code can be read by everyone who opens the app, so keys never go there. Nothing in your app changed.`,
+    );
+  }
+
+  const written = new Set(o.applied.written.map((w) => w.path));
+  for (const c of result.changed) {
+    await writeProjectFile(o.projectId, c.path, c.content);
+    if (!written.has(c.path)) o.emit({ type: 'file', path: c.path, status: 'done', change: 'modified', lines: c.content.split('\n').length - 1 });
+    o.applied.written = [...o.applied.written.filter((w) => w.path !== c.path), c];
+    if (!o.applied.touched.includes(c.path)) o.applied.touched.push(c.path);
+    if (c.path === 'package.json') o.applied.dependenciesChanged = true;
+  }
+  for (const spec of result.added) o.emit({ type: 'dependency', spec, status: 'added', detail: `${spec} (imported by the code, added automatically)` });
+  return result.issues.map((i) => ({ type: 'BUILD_ERROR', message: i.message, file: i.file, prerun: true }));
+}
+
 /** Files the build check asks the dev server to compile. */
 const BUILDABLE = /^src\/.+\.(?:tsx?|jsx?|css)$/;
+/** Files that make a typecheck worth running. */
+const TYPED = /^src\/.+\.tsx?$/;
+
+interface TypecheckRun {
+  errors: TypeErrorLine[];
+  /** Why tsc could not give an answer (timed out, not installed…). */
+  note?: string;
+}
 
 /**
  * 9 COLLECT: build errors from the dev server itself (deterministic, needs no
- * browser), then — if nothing failed to build — what the preview reported
- * through the builder page within its watch window.
+ * browser), then — if everything builds — what the preview reported through
+ * the builder page within its watch window, and the typecheck.
  */
 async function collect(o: {
   sandbox: Sandbox;
@@ -289,7 +432,7 @@ async function collect(o: {
   emit: (e: TurnEvent) => void;
   signal: AbortSignal;
   previewReports: boolean;
-}): Promise<PreviewError[]> {
+}): Promise<{ errors: PreviewError[]; types: TypecheckRun | null }> {
   o.emit({ type: 'stage', stage: 'collect' });
   const found: PreviewError[] = [];
   const code = o.applied.written.map((w) => w.path).filter((p) => BUILDABLE.test(p));
@@ -298,7 +441,12 @@ async function collect(o: {
       found.push({ type: 'BUILD_ERROR', message: f.message, frame: f.frame, file: f.path });
     }
   }
-  if (!found.length && o.previewReports) {
+  if (found.length) return { errors: dedupeErrors(found), types: null };
+
+  // The typecheck runs while the preview is watched; it is niced, so the dev
+  // server building the page keeps the CPU.
+  const typecheck = o.applied.written.some((w) => TYPED.test(w.path)) ? runTypecheck(o.sandbox) : null;
+  if (o.previewReports) {
     const origin = new URL(o.sandbox.previewUrl()).origin;
     const watch = async (check: number, remounted: boolean, fresh: boolean): Promise<PreviewError[]> => {
       // A fresh load waits for the shim's verdict, RENDER_OK or BLANK_SCREEN,
@@ -319,7 +467,34 @@ async function collect(o: {
     }
     found.push(...seen);
   }
-  return dedupeErrors(found);
+  return { errors: dedupeErrors(found), types: typecheck ? await typecheck : null };
+}
+
+async function runTypecheck(sandbox: Sandbox): Promise<TypecheckRun> {
+  try {
+    const res = await sandbox.exec(TYPECHECK_COMMAND, { timeoutMs: 90_000 });
+    if (res.code === 0) return { errors: [] };
+    const errors = parseTypeErrors(`${res.stdout}\n${res.stderr}`);
+    return errors.length ? { errors } : { errors: [], note: `tsc exited with code ${res.code}` };
+  } catch (err) {
+    return { errors: [], note: (err as Error).message };
+  }
+}
+
+/** The typecheck gate's row. After its one repair round, errors left are a warning: the app runs. */
+function typecheckResult(run: TypecheckRun, repairUsed: boolean): GateResult {
+  const n = run.errors.length;
+  if (!n) return run.note ? { gate: 'typecheck', status: 'warn', detail: `could not check: ${run.note}` } : { gate: 'typecheck', status: 'pass', detail: 'no type errors' };
+  const errors = `${n} type error${n === 1 ? '' : 's'}`;
+  return repairUsed ? { gate: 'typecheck', status: 'warn', detail: `${errors} left — the app runs` } : { gate: 'typecheck', status: 'fail', detail: errors };
+}
+
+/** All of a typecheck's errors as one failure: one repair round fixes them together. */
+function typeErrorOf(lines: TypeErrorLine[]): PreviewError {
+  const [first] = lines;
+  const list = lines.slice(0, 8).map((l) => `${l.file}:${l.line}:${l.column} ${l.code}: ${l.message}`);
+  if (lines.length > 8) list.push(`…and ${lines.length - 8} more`);
+  return { type: 'TYPE_ERROR', message: `${first.code}: ${first.message}`, file: first.file, line: first.line, stack: list.join('\n') };
 }
 
 /** The §10 fix prompt, with the files the failure points at. */
@@ -332,13 +507,14 @@ async function fixPrompt(projectId: string, error: PreviewError, stuck: boolean)
   return buildFixPrompt(error, diagnoseError(error), files, { stuck });
 }
 
-/** 3 PLAN+EMIT and 5 APPLY for one model call. */
+/** 3 PLAN+EMIT, 4 STREAM FIX and 5 APPLY for one model call. */
 async function modelPass(opts: {
   projectId: string;
   provider: ModelProvider;
   conversation: ModelMessage[];
   emit: (e: TurnEvent) => void;
   signal: AbortSignal;
+  registry: Registry;
   /** Set for repairs and whole-file retries, whose prose stays out of the chat; only their files show. */
   label?: string;
 }): Promise<Pass> {
@@ -382,7 +558,7 @@ async function modelPass(opts: {
   onParse(parser.end());
 
   emit({ type: 'stage', stage: 'apply' });
-  const applied = await applyOps(projectId, ops, known, (e) => {
+  const applied = await applyOps(projectId, ops, known, opts.registry, (e) => {
     if (e.type === 'file' && e.status === 'failed') problems.push(`${e.path}: ${e.error}`);
     emit(e);
   });
@@ -408,6 +584,7 @@ function mergeApplied(a: Applied, b: Applied): Applied {
     dependenciesChanged: a.dependenciesChanged || b.dependenciesChanged,
     touched: [...new Set([...a.touched, ...b.touched])],
     failedEdits: b.failedEdits,
+    fixes: [...a.fixes.filter((f) => !rewritten.has(f.path)), ...b.fixes],
   };
 }
 
@@ -430,13 +607,39 @@ function normalise(path: string): string {
   }
 }
 
+/** The project's paths once every operation is applied, so imports can be checked against files written later in the same reply. */
+function plannedPaths(known: Set<string>, ops: ChangeOp[]): Set<string> {
+  const paths = new Set(known);
+  for (const op of ops) {
+    try {
+      if (op.type === 'write' || op.type === 'edit') paths.add(safeRelativePath(op.path));
+      else if (op.type === 'delete') paths.delete(safeRelativePath(op.path));
+      else if (op.type === 'rename') {
+        paths.delete(safeRelativePath(op.from));
+        paths.add(safeRelativePath(op.to));
+      }
+    } catch {
+      /* an invalid path fails when its operation is applied */
+    }
+  }
+  return paths;
+}
+
 async function applyOps(
   projectId: string,
   ops: ChangeOp[],
   known: Set<string>,
+  registry: Registry,
   emit: (e: TurnEvent) => void,
 ): Promise<Applied> {
-  const applied: Applied = { written: [], deleted: [], dependenciesChanged: false, touched: [], failedEdits: [] };
+  const applied: Applied = { written: [], deleted: [], dependenciesChanged: false, touched: [], failedEdits: [], fixes: [] };
+  const planned = plannedPaths(known, ops);
+  // 4 STREAM FIX — each file is corrected on its way from the stream to disk.
+  const fixed = (path: string, content: string) => {
+    const out = fixSource(path, content, planned);
+    for (const f of out.fixes) applied.fixes.push({ path, ...f });
+    return out.content;
+  };
   const fail = (path: string, change: FileChange, error: string) => emit({ type: 'file', path, status: 'failed', change, error });
   const record = (path: string, content: string, change: FileChange) => {
     applied.written.push({ path, content });
@@ -455,8 +658,9 @@ async function applyOps(
           fail(path, change, 'This file is managed by the builder and cannot be changed.');
           continue;
         }
-        await writeProjectFile(projectId, path, op.content);
-        record(path, op.content, change);
+        const content = fixed(path, op.content);
+        await writeProjectFile(projectId, path, content);
+        record(path, content, change);
       } catch (err) {
         fail(op.path, change, (err as Error).message);
       }
@@ -474,8 +678,9 @@ async function applyOps(
           fail(path, 'modified', result.reason);
           continue;
         }
-        await writeProjectFile(projectId, path, result.content);
-        record(path, result.content, 'modified');
+        const content = fixed(path, result.content);
+        await writeProjectFile(projectId, path, content);
+        record(path, content, 'modified');
       } catch (err) {
         fail(op.path, 'modified', (err as Error).message);
       }
@@ -515,7 +720,7 @@ async function applyOps(
         fail(op.to, 'renamed', (err as Error).message);
       }
     } else if (op.type === 'add-dependency') {
-      const result = await addDependency(projectId, op.spec);
+      const result = await addDependency(projectId, op.spec, registry);
       emit({ type: 'dependency', spec: op.spec, status: result.ok ? 'added' : 'rejected', detail: result.detail });
       if (result.ok && result.content) {
         applied.written = applied.written.filter((w) => w.path !== 'package.json');
@@ -535,9 +740,14 @@ export function splitSpec(spec: string): [string, string] {
   return [spec, 'latest'];
 }
 
-async function addDependency(projectId: string, spec: string): Promise<{ ok: boolean; detail?: string; content?: string }> {
-  const [name, range] = splitSpec(spec.trim());
+async function addDependency(projectId: string, spec: string, registry: Registry): Promise<{ ok: boolean; detail?: string; content?: string }> {
+  const [name, requested] = splitSpec(spec.trim());
   if (!/^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/.test(name)) return { ok: false, detail: `"${name}" is not a valid package name` };
+  // Never install a package that does not exist (§9b): a made-up name can be
+  // registered by anyone. An unreachable registry is not a verdict.
+  const found = await registry.lookup(name);
+  if (found && !found.exists) return { ok: false, detail: `${name} does not exist on npm, so it was not added` };
+  const range = requested === 'latest' && found?.latest ? `^${found.latest}` : requested;
   const raw = await readProjectFile(projectId, 'package.json');
   if (!raw) return { ok: false, detail: 'package.json is missing' };
   const pkg = JSON.parse(raw) as { dependencies?: Record<string, string> };
@@ -550,12 +760,18 @@ async function addDependency(projectId: string, spec: string): Promise<{ ok: boo
 async function syncToSandbox(sandbox: Sandbox, applied: Applied, emit: (e: TurnEvent) => void): Promise<void> {
   const deleted = applied.deleted.filter((p) => !applied.written.some((w) => w.path === p));
   if (deleted.length) await sandbox.deleteFiles(deleted);
-  if (applied.written.length) await sandbox.writeFiles(applied.written);
+  // New dependencies are installed before the code that imports them arrives:
+  // the dev server would otherwise show "Failed to resolve import" on the
+  // preview for as long as the install runs.
+  const manifest = applied.dependenciesChanged ? applied.written.filter((w) => w.path === 'package.json') : [];
+  const code = applied.written.filter((w) => !manifest.includes(w));
+  if (manifest.length) await sandbox.writeFiles(manifest);
   if (applied.dependenciesChanged) {
     emit({ type: 'sandbox', status: 'starting', detail: 'Installing dependencies' });
     const install = await sandbox.installDependencies();
     if (!install.ok) emit({ type: 'warning', message: `Dependency install failed:\n${install.log.slice(-1200)}` });
   }
+  if (code.length) await sandbox.writeFiles(code);
 }
 
 /** Four polling intervals of the sandbox's file watcher (300ms, docker/template/vite.config.ts). */

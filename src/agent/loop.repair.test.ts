@@ -126,6 +126,8 @@ describe('runTurn repair loop', () => {
   }, 30_000);
 
   it('repairs a failure sent from the preview ("Fix it") without billing anything', async () => {
+    // The recipe app, as a turn whose check happened to pass; the crash shows up later.
+    await turn('fixit1', 'Show my recipes — render data.map before the fetch resolves', () => rendered);
     const events: TurnEvent[] = [];
     const [, reported] = crash('fixit1');
     await runTurn({

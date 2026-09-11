@@ -27,8 +27,10 @@ interface PreviewPaneProps {
 }
 
 function headline(e: PreviewError): string {
+  if (e.prerun) return 'Caught before it reached the preview';
   if (e.type === 'BUILD_ERROR') return 'The preview can’t be built';
   if (e.type === 'BLANK_SCREEN') return 'The preview is blank';
+  if (e.type === 'TYPE_ERROR') return 'The code has type errors';
   return 'The preview crashed while rendering';
 }
 

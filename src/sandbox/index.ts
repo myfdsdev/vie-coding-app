@@ -72,7 +72,13 @@ export async function pushWorkspaceChanges(projectId: string, change: { written:
   const files = await Promise.all(
     change.written.map(async (path) => ({ path, content: (await readProjectFile(projectId, path)) ?? '' })),
   );
-  if (files.length) await sandbox.writeFiles(files);
-  if (change.written.includes('package.json')) await sandbox.installDependencies();
+  // Dependencies first, so the dev server never sees code importing a package that is not installed yet.
+  const manifest = files.filter((f) => f.path === 'package.json');
+  if (manifest.length) {
+    await sandbox.writeFiles(manifest);
+    await sandbox.installDependencies();
+  }
+  const code = files.filter((f) => f.path !== 'package.json');
+  if (code.length) await sandbox.writeFiles(code);
   return sandbox;
 }

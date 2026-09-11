@@ -1,5 +1,9 @@
 import type { FileChange, TurnEvent } from '@/agent/types';
+import type { GateResult } from '@/agent/validate';
 import type { PreviewError } from '@/preview/events';
+
+/** One pre-execution check (§9) as the chat shows it. */
+export type CheckRow = GateResult;
 
 export interface FileRow {
   path: string;
@@ -48,6 +52,8 @@ export interface AssistantTurn {
   /** Set when the repair budget ran out with the preview still failing. */
   failure?: { error: PreviewError; cause: string; attempts: number; rollback?: { number: number; sha: string } };
   meter?: { billed: number; free: number; balance: number };
+  /** The checks run before the change reached the preview, one row per gate. Absent before M3. */
+  checks?: CheckRow[];
 }
 
 export interface RepairRow {
@@ -72,6 +78,7 @@ const STAGE_LABEL: Record<string, string> = {
   context: 'Reading the project',
   emit: 'Writing code',
   apply: 'Saving files',
+  validate: 'Checking the code',
   checkpoint: 'Saving a version',
   execute: 'Updating the preview',
   collect: 'Checking the preview',
@@ -89,8 +96,25 @@ export function applyTurnEvent(turn: AssistantTurn, e: TurnEvent): AssistantTurn
   switch (e.type) {
     case 'turn-start':
       return { ...turn, model: e.model, turnId: e.turnId };
-    case 'check':
-      return { ...turn, errors: e.errors, repairs: e.errors.length ? turn.repairs : settleRepairs(turn.repairs, 'fixed') };
+    case 'check': {
+      if (e.errors.length) return { ...turn, errors: e.errors };
+      // The app works. A type-error repair only counts as fixed if no type errors are left.
+      const typesLeft = (e.typeErrors ?? 0) > 0;
+      const repairs = (turn.repairs ?? []).map((r) =>
+        r.status !== 'fixing' ? r : { ...r, status: r.error.type === 'TYPE_ERROR' && typesLeft ? ('failed' as const) : ('fixed' as const) },
+      );
+      return { ...turn, errors: [], repairs };
+    }
+    case 'gate': {
+      const checks = turn.checks ?? [];
+      const prev = checks.find((c) => c.gate === e.gate);
+      // A later pass does not hide what an earlier attempt corrected.
+      const row: CheckRow =
+        e.status === 'pass' && prev && (prev.status === 'fixed' || prev.status === 'fail')
+          ? { gate: e.gate, status: 'fixed', detail: prev.status === 'fixed' ? prev.detail : e.detail }
+          : { gate: e.gate, status: e.status, detail: e.detail };
+      return { ...turn, checks: prev ? checks.map((c) => (c.gate === e.gate ? row : c)) : [...checks, row] };
+    }
     case 'repair': {
       // A new round on the same failure means the last fix did not hold; a different failure means it did.
       const earlier = settleRepairs(turn.repairs, 'failed', e.signature);

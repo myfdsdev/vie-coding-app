@@ -162,6 +162,22 @@ export function restoreVersion(
   });
 }
 
+/**
+ * Throw away every change since the last version — for a turn that must not
+ * run at all (it wrote a secret into app code). Files it created are removed;
+ * returns their paths.
+ */
+export function discardChanges(projectId: string): Promise<{ removed: string[] }> {
+  return serial(projectId, async () => {
+    const repo = git(projectId);
+    await repo.raw(['restore', '--source=HEAD', '--staged', '--worktree', '--', '.']);
+    // After the restore, everything this turn created is untracked.
+    const removed = (await repo.raw(['ls-files', '--others', '--exclude-standard'])).split('\n').filter(Boolean);
+    await repo.raw(['clean', '-fdq']);
+    return { removed };
+  });
+}
+
 function oneLine(text: string): string {
   const line = text.replace(/\s+/g, ' ').trim();
   return (line.length > 72 ? `${line.slice(0, 71)}…` : line) || 'Update';

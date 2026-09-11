@@ -18,6 +18,9 @@ const request = (message: string, context = '') => ({
   messages: [{ role: 'user' as const, content: message }],
 });
 
+/** The shape of a buildFixPrompt() for the demo crash. */
+const CRASH_PROMPT = "The app failed with the following error. Fix it.\n\nERROR TYPE: REACT_RENDER_ERROR\nMESSAGE: Cannot read properties of undefined (reading 'map')";
+
 describe('mock provider output', () => {
   it('builds the starter app as whole-file writes the parser accepts cleanly', () => {
     const { ops, warnings } = parse(mockResponse(request('build me a recipe tracker')));
@@ -66,16 +69,32 @@ describe('mock provider output', () => {
     const home = broken.ops.find((o) => o.type === 'write' && o.path === 'src/pages/Home.tsx');
     expect(home?.type === 'write' && home.content).toContain('{data.map((recipe)');
 
-    const prompt = "The app failed with the following error. Fix it.\nMESSAGE: Cannot read properties of undefined (reading 'map')";
-    const fixed = parse(mockResponse(request(prompt))).ops.find((o) => o.type === 'write' && o.path === 'src/pages/Home.tsx');
+    const fixed = parse(mockResponse(request(CRASH_PROMPT))).ops.find((o) => o.type === 'write' && o.path === 'src/pages/Home.tsx');
     expect(fixed?.type === 'write' && fixed.content).toContain('isLoading ?');
   });
 
   it('never really fixes the unfixable demo', () => {
-    const prompt = "The app failed with the following error. Fix it.\nMESSAGE: Cannot read properties of undefined (reading 'map')";
-    const { ops } = parse(mockResponse(request(prompt, '// forge-mock: unfixable')));
+    const { ops } = parse(mockResponse(request(CRASH_PROMPT, '// forge-mock: unfixable')));
     const home = ops.find((o) => o.type === 'write' && o.path === 'src/pages/Home.tsx');
     expect(home?.type === 'write' && home.content).toContain('{data!.map((recipe)');
+  });
+
+  it('builds the dashboard with the five mistakes the stream fixer and gates correct', () => {
+    const { ops, warnings } = parse(mockResponse(request('An invoice dashboard')));
+    expect(warnings).toEqual([]);
+    const all = ops.map((o) => (o.type === 'write' ? o.content : '')).join('\n');
+    for (const mistake of ["LayoutDashbaord", "from '@/components/InvoiceTable'", "from './lib/format'", "from 'date-fns'", "from 'lucide-react-icons'"]) {
+      expect(all).toContain(mistake);
+    }
+    expect(all).not.toContain('Sidebar');
+    expect(mockResponse(request('An invoice dashboard with a sidebar'))).toContain("import { Sidebar } from '../components/Sidebar';");
+  });
+
+  it('writes a file that was imported but never created', () => {
+    const prompt = 'The app failed with the following error. Fix it.\n\nERROR TYPE: BUILD_ERROR\nMESSAGE: Failed to resolve import "../components/Sidebar" from "src/pages/Home.tsx". Does the file exist?';
+    const { ops } = parse(mockResponse(request(prompt)));
+    expect(ops.map((o) => (o.type === 'write' ? o.path : o.type))).toEqual(['src/components/Sidebar.tsx']);
+    expect(ops[0].type === 'write' && ops[0].content).toContain('export function Sidebar()');
   });
 
   it('derives a title from the prompt', () => {
