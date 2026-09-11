@@ -39,7 +39,7 @@ export function waitForReport(turnId: string, attempt: number, timeoutMs: number
     };
     const onAbort = () => finish(null);
     signal?.addEventListener('abort', onAbort, { once: true });
-    slots.set(key, { waiter: finish, timer: setTimeout(() => finish(null), timeoutMs) });
+    slots.set(key, { waiter: finish, timer: background(setTimeout(() => finish(null), timeoutMs)) });
   });
 }
 
@@ -52,5 +52,11 @@ export function deliverReport(turnId: string, attempt: number, events: PreviewEv
     return;
   }
   if (slot?.timer) clearTimeout(slot.timer);
-  slots.set(key, { report: events, timer: setTimeout(() => slots.delete(key), 60_000) });
+  slots.set(key, { report: events, timer: background(setTimeout(() => slots.delete(key), 60_000)) });
+}
+
+/** Housekeeping timers must never keep the process alive on their own. */
+function background(timer: ReturnType<typeof setTimeout>): ReturnType<typeof setTimeout> {
+  (timer as { unref?: () => void }).unref?.();
+  return timer;
 }
