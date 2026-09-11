@@ -10,11 +10,13 @@ interface ChatPaneProps {
   busy: boolean;
   onSend: (text: string) => void;
   onStop: () => void;
+  /** Restore the version a failed repair offers to go back to. */
+  onRollback: (sha: string) => void;
 }
 
 const SUGGESTIONS = ['A task board for my team', 'A recipe box with cook times', 'A client portal for invoices'];
 
-export function ChatPane({ messages, busy, onSend, onStop }: ChatPaneProps) {
+export function ChatPane({ messages, busy, onSend, onStop, onRollback }: ChatPaneProps) {
   const [draft, setDraft] = useState('');
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -64,7 +66,7 @@ export function ChatPane({ messages, busy, onSend, onStop }: ChatPaneProps) {
               </div>
             </div>
           ) : (
-            <AssistantMessage key={m.id} turn={m} />
+            <AssistantMessage key={m.id} turn={m} onStop={onStop} onRollback={onRollback} />
           ),
         )}
       </div>

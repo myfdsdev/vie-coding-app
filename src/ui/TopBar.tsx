@@ -1,15 +1,16 @@
 import Link from 'next/link';
-import { Box, History, Zap } from 'lucide-react';
+import { Box, Cpu, History, Zap } from 'lucide-react';
 
 interface TopBarProps {
   project: { id: string; name: string };
   provider: string;
   model: string;
+  credits: number;
   historyOpen: boolean;
   onToggleHistory: () => void;
 }
 
-export function TopBar({ project, provider, model, historyOpen, onToggleHistory }: TopBarProps) {
+export function TopBar({ project, provider, model, credits, historyOpen, onToggleHistory }: TopBarProps) {
   const mock = provider === 'mock';
   return (
     <header className="flex h-12 shrink-0 items-center gap-3.5 border-b border-line bg-panel px-3.5">
@@ -26,12 +27,20 @@ export function TopBar({ project, provider, model, historyOpen, onToggleHistory 
       </div>
       <div className="flex-1" />
       <div
-        className="flex items-center gap-1.5 rounded-md border border-line bg-panel-2 px-2.5 py-1.5"
+        className="flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5"
         title={mock ? 'No API key configured — using the offline mock model' : `Provider: ${provider}`}
       >
-        <Zap size={13} className="text-accent" />
+        <Cpu size={13} className="text-dim" />
         <span className="font-mono text-[11px] text-text-2">{model}</span>
         {mock && <span className="text-[11px] text-dim-2">offline mock</span>}
+      </div>
+      <div
+        className="flex items-center gap-1.5 rounded-md border border-line bg-panel-2 px-2.5 py-1.5"
+        title="Credits left. Repair attempts and builds that end broken are never billed."
+      >
+        <Zap size={13} className="text-accent" />
+        <span className="font-mono text-[11px] text-text-2">{Math.floor(credits).toLocaleString('en-US')}</span>
+        <span className="text-[11px] text-dim-2">credits</span>
       </div>
       <button
         onClick={onToggleHistory}
