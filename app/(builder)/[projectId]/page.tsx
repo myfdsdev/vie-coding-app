@@ -2,6 +2,7 @@ import { notFound } from 'next/navigation';
 import { modelName, resolveProviderName } from '@/agent/providers';
 import { previewHost, publicPort } from '@/sandbox/docker';
 import { listMessages } from '@/store/chats';
+import { balance } from '@/store/meter';
 import { ensureProject, isProjectId, listProjectFiles, projectExists } from '@/store/projects';
 import { Builder } from '@/ui/Builder';
 
@@ -34,6 +35,7 @@ export default async function BuilderPage({ params }: { params: { projectId: str
       previewUrl={`http://${previewHost(projectId)}:${publicPort()}`}
       initialMessages={listMessages(projectId)}
       initialFiles={files}
+      initialCredits={balance()}
     />
   );
 }

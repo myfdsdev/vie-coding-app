@@ -60,6 +60,24 @@ describe('mock provider output', () => {
     expect(ops.map((o) => `${o.type} ${'path' in o ? o.path : ''}`)).toEqual(['write src/components/Header.tsx']);
   });
 
+  it('builds a recipe page that crashes before its data loads, and fixes it when asked', () => {
+    const broken = parse(mockResponse(request('render data.map before the fetch resolves')));
+    expect(broken.warnings).toEqual([]);
+    const home = broken.ops.find((o) => o.type === 'write' && o.path === 'src/pages/Home.tsx');
+    expect(home?.type === 'write' && home.content).toContain('{data.map((recipe)');
+
+    const prompt = "The app failed with the following error. Fix it.\nMESSAGE: Cannot read properties of undefined (reading 'map')";
+    const fixed = parse(mockResponse(request(prompt))).ops.find((o) => o.type === 'write' && o.path === 'src/pages/Home.tsx');
+    expect(fixed?.type === 'write' && fixed.content).toContain('isLoading ?');
+  });
+
+  it('never really fixes the unfixable demo', () => {
+    const prompt = "The app failed with the following error. Fix it.\nMESSAGE: Cannot read properties of undefined (reading 'map')";
+    const { ops } = parse(mockResponse(request(prompt, '// forge-mock: unfixable')));
+    const home = ops.find((o) => o.type === 'write' && o.path === 'src/pages/Home.tsx');
+    expect(home?.type === 'write' && home.content).toContain('{data!.map((recipe)');
+  });
+
   it('derives a title from the prompt', () => {
     expect(titleFrom('build me a recipe tracker for my family')).toBe('Recipe Tracker Family');
     expect(titleFrom('   ')).toBe('Task Board');

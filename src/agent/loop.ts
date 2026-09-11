@@ -299,15 +299,25 @@ async function collect(o: {
     }
   }
   if (!found.length && o.previewReports) {
-    // A fresh page load needs time for the shim's RENDER_OK (2.5s after load).
-    const windowMs = o.remounted ? 4000 : 2500;
-    o.emit({ type: 'collect', turnId: o.turnId, attempt: o.attempt, windowMs, remounted: o.remounted });
-    const events = await waitForReport(o.turnId, o.attempt, windowMs + 8000, o.signal);
     const origin = new URL(o.sandbox.previewUrl()).origin;
-    for (const e of events ?? []) {
-      const error = toPreviewError(e, origin);
-      if (error) found.push(error);
+    const watch = async (check: number, remounted: boolean, fresh: boolean): Promise<PreviewError[]> => {
+      // A fresh load waits for the shim's verdict, RENDER_OK or BLANK_SCREEN,
+      // 2.5s after load — later on a cold sandbox. The page ends the watch
+      // early on RENDER_OK or a crash.
+      const windowMs = remounted ? (fresh ? 8000 : 12_000) : 2500;
+      o.emit({ type: 'collect', turnId: o.turnId, attempt: o.attempt, check, windowMs, remounted, fresh });
+      const events = await waitForReport(o.turnId, check, windowMs + 8000, o.signal);
+      return dedupeErrors((events ?? []).map((e) => toPreviewError(e, origin)).filter((e): e is PreviewError => e !== null));
+    };
+    // Check ids: 2 per attempt, one look and one possible second look.
+    let seen = await watch(o.attempt * 2, o.remounted, false);
+    // "Blank" and nothing else may only mean the first load was slower than the
+    // shim's 2.5s deadline. Look once more on a fresh load, which is warm by now.
+    if (seen.length === 1 && seen[0].type === 'BLANK_SCREEN') {
+      o.emit({ type: 'preview-reload' });
+      seen = await watch(o.attempt * 2 + 1, true, true);
     }
+    found.push(...seen);
   }
   return dedupeErrors(found);
 }

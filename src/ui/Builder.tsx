@@ -118,16 +118,19 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
 
   /**
    * 9 COLLECT, page side: watch the preview after the change, then report what
-   * it said. A failure ends the watch early (after its companion reports
-   * arrive); so does RENDER_OK on a fresh load.
+   * it said. A crash ends the watch early (once React's companion reports have
+   * arrived), and so does RENDER_OK on a fresh load. BLANK_SCREEN does not: on
+   * a cold sandbox the shim can call a page blank before React has rendered,
+   * and the real crash arrives afterwards.
    */
-  const reportPreview = useCallback(async (turnId: string, attempt: number, windowMs: number, remounted: boolean) => {
-    const start = attemptStartRef.current;
+  const reportPreview = useCallback(async (turnId: string, check: number, windowMs: number, remounted: boolean, fresh: boolean) => {
+    const start = fresh ? Date.now() : attemptStartRef.current;
     const seen = () => eventsRef.current.filter((x) => x.at >= start);
+    const crashed = (e: PreviewEvent) => isFailureEvent(e) && e.type !== 'BLANK_SCREEN';
     const deadline = Date.now() + windowMs;
     while (Date.now() < deadline) {
       await sleep(150);
-      if (seen().some((x) => isFailureEvent(x.event))) {
+      if (seen().some((x) => crashed(x.event))) {
         await sleep(600);
         break;
       }
@@ -136,7 +139,7 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
     await fetch(`/api/turns/${turnId}/report`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ attempt, events: seen().map((x) => x.raw) }),
+      body: JSON.stringify({ check, events: seen().map((x) => x.raw) }),
     }).catch(() => undefined);
   }, []);
 
@@ -171,7 +174,7 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
               if (event.stage === 'execute') attemptStartRef.current = Date.now();
               break;
             case 'collect':
-              void reportPreview(event.turnId, event.attempt, event.windowMs, event.remounted);
+              void reportPreview(event.turnId, event.check, event.windowMs, event.remounted, !!event.fresh);
               break;
             case 'meter':
               setCredits(event.balance);

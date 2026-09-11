@@ -35,14 +35,27 @@ const TITLE: Record<RepairRow['error']['type'], string> = {
   BLANK_SCREEN: 'Blank screen caught',
 };
 
-/** One repair round (ErrorFix design): the diagnosed error, then the attempt to fix it. */
-function RepairCard({ repair, onStop }: { repair: RepairRow; onStop?: () => void }) {
+/** Consecutive rounds on the same failure share one error card; its fixing card shows the latest attempt. */
+function groupRepairs(repairs: RepairRow[]): RepairRow[][] {
+  const groups: RepairRow[][] = [];
+  for (const r of repairs) {
+    const last = groups[groups.length - 1];
+    if (last && last[0].signature === r.signature) last.push(r);
+    else groups.push([r]);
+  }
+  return groups;
+}
+
+/** One failure and the attempts to fix it (ErrorFix design): the diagnosed error, then "Attempt n of 3". */
+function RepairCard({ rows, onStop }: { rows: RepairRow[]; onStop?: () => void }) {
   const [open, setOpen] = useState(false);
-  const e = repair.error;
+  const first = rows[0];
+  const latest = rows[rows.length - 1];
+  const e = first.error;
   const where = e.file ? `${e.file.split('/').pop()}${e.line ? `:${e.line}` : ''}` : null;
   // Stack traces live behind a disclosure; the diagnosis is what the user reads.
   const details = [e.componentStack && `Component stack:\n${e.componentStack}`, e.stack && `Stack:\n${e.stack}`, e.frame].filter(Boolean).join('\n\n');
-  const state = repair.status === 'fixing' ? 'Fixing' : repair.status === 'fixed' ? 'Fixed' : 'Did not hold';
+  const state = latest.status === 'fixing' ? 'Fixing' : latest.status === 'fixed' ? 'Fixed' : 'Did not hold';
 
   return (
     <div className="flex flex-col gap-2.5">
@@ -57,7 +70,7 @@ function RepairCard({ repair, onStop }: { repair: RepairRow; onStop?: () => void
           <div className="break-words font-mono text-[11.5px] leading-[1.55] text-[#e8b4b2]">{e.message}</div>
           <div className="flex flex-col gap-[5px] rounded-[7px] border border-[#33221f] bg-[#1a1413] px-2.5 py-[9px]">
             <span className="text-[10.5px] font-semibold uppercase tracking-[0.05em] text-[#a08a6a]">Likely cause</span>
-            <span className="text-xs leading-[1.55] text-text-2">{repair.cause}</span>
+            <span className="text-xs leading-[1.55] text-text-2">{first.cause}</span>
           </div>
           {details && (
             <button onClick={() => setOpen((o) => !o)} className="self-start text-[11px] text-dim hover:text-text-2">
@@ -74,23 +87,23 @@ function RepairCard({ repair, onStop }: { repair: RepairRow; onStop?: () => void
 
       <div className="overflow-hidden rounded-[10px] border border-line bg-panel-2">
         <div className="flex items-center gap-2 border-b border-line px-3 py-2.5">
-          {repair.status === 'fixing' && <span className="spinner" />}
-          {repair.status === 'fixed' && <Check size={12} strokeWidth={2.5} className="text-ok" />}
-          {repair.status === 'failed' && <X size={12} strokeWidth={2.5} className="text-err" />}
+          {latest.status === 'fixing' && <span className="spinner" />}
+          {latest.status === 'fixed' && <Check size={12} strokeWidth={2.5} className="text-ok" />}
+          {latest.status === 'failed' && <X size={12} strokeWidth={2.5} className="text-err" />}
           <span className="text-[11px] font-semibold uppercase tracking-[0.04em] text-dim">{state}</span>
           <span className="flex-1" />
           <span className="flex items-center gap-[3px]">
-            {Array.from({ length: repair.of }, (_, i) => (
-              <span key={i} className={'block h-[3px] w-3.5 rounded-sm ' + (i < repair.attempt ? 'bg-accent' : 'bg-line')} />
+            {Array.from({ length: latest.of }, (_, i) => (
+              <span key={i} className={'block h-[3px] w-3.5 rounded-sm ' + (i < latest.attempt ? 'bg-accent' : 'bg-line')} />
             ))}
           </span>
           <span className="font-mono text-[10.5px] text-dim-2">
-            {repair.attempt} of {repair.of}
+            {latest.attempt} of {latest.of}
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-[11px] text-xs text-text">
-          <span>{capitalise(repair.action)}</span>
-          {repair.stuck && <span className="text-[11px] text-dim">— the last fix didn&apos;t hold, trying a different approach</span>}
+          <span>{capitalise(latest.action)}</span>
+          {latest.stuck && <span className="text-[11px] text-dim">— the last fix didn&apos;t hold, trying a different approach</span>}
         </div>
         <div className="flex items-center gap-[7px] border-t border-[#24301f] bg-[#161d16] px-3 py-[9px]">
           <Check size={12} className="shrink-0 text-ok" />
@@ -98,7 +111,7 @@ function RepairCard({ repair, onStop }: { repair: RepairRow; onStop?: () => void
         </div>
       </div>
 
-      {repair.status === 'fixing' && onStop && (
+      {latest.status === 'fixing' && onStop && (
         <button onClick={onStop} className="rounded-[7px] border border-line py-2 text-xs font-medium text-[#a49c92] transition hover:border-line-raised">
           Stop and let me look
         </button>
@@ -191,8 +204,8 @@ export function AssistantMessage({ turn, onStop, onRollback }: AssistantMessageP
 
       {turn.summary.trim() && <Prose text={turn.summary.trim()} className="leading-relaxed text-text" />}
 
-      {repairs.map((r) => (
-        <RepairCard key={r.round} repair={r} onStop={turn.status === 'streaming' ? onStop : undefined} />
+      {groupRepairs(repairs).map((rows) => (
+        <RepairCard key={rows[0].round} rows={rows} onStop={turn.status === 'streaming' ? onStop : undefined} />
       ))}
       {repairs.length > 0 && turn.status === 'success' && (
         <div className="flex items-center gap-2 text-xs font-medium text-ok">

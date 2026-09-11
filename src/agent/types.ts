@@ -26,8 +26,12 @@ export type TurnEvent =
   | { type: 'checkpoint'; version: number; sha: string; subject: string }
   | { type: 'sandbox'; status: SandboxStatus; detail?: string; previewUrl?: string }
   | { type: 'preview-reload' }
-  /** The builder page should watch the preview for `windowMs`, then report what it saw for this attempt. */
-  | { type: 'collect'; turnId: string; attempt: number; windowMs: number; remounted: boolean }
+  /**
+   * The builder page should watch the preview (for up to `windowMs`), then
+   * report what it saw under `check`. `fresh`: a second look after a reload,
+   * counted from now rather than from the attempt's change.
+   */
+  | { type: 'collect'; turnId: string; attempt: number; check: number; windowMs: number; remounted: boolean; fresh?: boolean }
   /** What checking the preview found after an attempt; empty means it works. */
   | { type: 'check'; attempt: number; errors: PreviewError[] }
   /** A repair attempt starts: "Attempt 2 of 3 — adding a loading guard". */

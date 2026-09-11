@@ -1,4 +1,5 @@
 import type { FileChange, TurnEvent } from '@/agent/types';
+import type { PreviewError } from '@/preview/events';
 
 export interface FileRow {
   path: string;
