@@ -114,7 +114,8 @@ const TABLE: { match: RegExp; diagnose: (m: RegExpMatchArray) => Diagnosis }[] =
     }),
   },
   {
-    match: /Transform failed|Expected ".+" but found|Unexpected token|Unterminated|Failed to parse source/,
+    // esbuild ("Expected ... but found"), Babel ("Unexpected keyword 'return'") and Vite's own wording.
+    match: /Transform failed|Expected ".+" but found|Unexpected (?:token|keyword|character|reserved word)|Unterminated|Missing semicolon|Failed to parse source/,
     diagnose: () => ({
       cause: 'The file has a syntax error, so it cannot be built.',
       action: 'fixing a syntax error',

@@ -124,4 +124,27 @@ describe('runTurn repair loop', () => {
     expect(ofType(events, 'repair')).toHaveLength(0);
     expect(events[events.length - 1]).toMatchObject({ type: 'turn-end', outcome: 'success' });
   }, 30_000);
+
+  it('repairs a failure sent from the preview ("Fix it") without billing anything', async () => {
+    const events: TurnEvent[] = [];
+    const [, reported] = crash('fixit1');
+    await runTurn({
+      projectId: 'fixit1',
+      message: 'Fix the error in the preview',
+      previewReports: true,
+      repairOf: { type: 'REACT_RENDER_ERROR', message: reported.type === 'REACT_RENDER_ERROR' ? reported.message : '', file: 'src/pages/Home.tsx' },
+      signal: new AbortController().signal,
+      emit: (e) => {
+        events.push(e);
+        if (e.type === 'collect') setTimeout(() => deliverReport(e.turnId, e.check, rendered), 5);
+      },
+    });
+    // The turn starts as a repair: diagnosed, attempt 1 of 3, and the fix is saved as a repair version.
+    expect(ofType(events, 'repair')[0]).toMatchObject({ round: 1, attempt: 1, action: 'adding a loading guard' });
+    expect(ofType(events, 'check').map((c) => c.errors.length)).toEqual([0]);
+    const [meter] = ofType(events, 'meter');
+    expect(meter.billed).toBe(0);
+    expect(meter.free).toBeGreaterThan(0);
+    expect(events[events.length - 1]).toMatchObject({ type: 'turn-end', outcome: 'success' });
+  }, 30_000);
 });

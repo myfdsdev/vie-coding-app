@@ -99,7 +99,9 @@ export function viteError(body: string): { message: string; frame?: string } {
   if (json) {
     try {
       const err = JSON.parse(json) as { message?: string; frame?: string };
-      if (err.message) return { message: err.message.slice(0, 1000), frame: err.frame?.slice(0, 1500) };
+      // Paths inside the container (/app/src/...) mean nothing to the model or the user.
+      const repo = (s: string) => s.replace(/\/app\/(?=src\/)/g, '');
+      if (err.message) return { message: repo(err.message).slice(0, 1000), frame: err.frame ? repo(err.frame).slice(0, 1500) : undefined };
     } catch {
       /* fall through to the page text */
     }

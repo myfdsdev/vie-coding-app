@@ -14,6 +14,8 @@ describe('diagnose', () => {
     ['Maximum update depth exceeded. This can happen when a component calls setState inside useEffect', /useEffect/, 'stopping an update loop'],
     ["The requested module '/src/lib/api.ts' does not provide an export named 'getRecipes'", /export/, 'fixing the import of getRecipes'],
     ['permission denied for table recipes', /Row-level security/, 'fixing an access rule'],
+    // Real Vite 5 output for a file with a broken function signature.
+    ["src/syntax-error.tsx: Unexpected keyword 'return'. (2:2)", /syntax error/, 'fixing a syntax error'],
   ])('%s', (message, cause, action) => {
     const d = diagnose(message);
     expect(d?.cause).toMatch(cause);
