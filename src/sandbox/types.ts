@@ -20,6 +20,12 @@ export interface Sandbox {
   exec(cmd: string, opts?: { timeoutMs?: number }): Promise<{ code: number; stdout: string; stderr: string }>;
   previewUrl(): string;
   installDependencies(): Promise<{ ok: boolean; log: string }>;
+  /**
+   * Ask the dev server to build these modules now and return the ones that
+   * fail. Optional: a provider with no HTTP route to its dev server omits it,
+   * and the repair loop then relies on what the preview reports.
+   */
+  buildCheck?(paths: string[]): Promise<{ path: string; message: string; frame?: string }[]>;
   status(): Promise<SandboxStatus>;
   stop(): Promise<void>;
   destroy(): Promise<void>;

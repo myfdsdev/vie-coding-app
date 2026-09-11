@@ -163,6 +163,18 @@ class DockerSandbox implements Sandbox {
     return `http://${previewHost(this.id)}:${publicPort()}`;
   }
 
+  /** Ask Vite to build each module now. One it cannot build comes back as HTTP 500 with the error. */
+  async buildCheck(paths: string[]): Promise<{ path: string; message: string; frame?: string }[]> {
+    const results = await Promise.all(
+      paths.map(async (path) => {
+        const res = await previewRequest(this.id, '/' + path.split('/').map(encodeURIComponent).join('/'), 20_000);
+        // 0 (unreachable) and 404 (no such module) are not build failures.
+        return res.status >= 500 ? { path, ...viteError(res.body) } : null;
+      }),
+    );
+    return results.filter((r): r is { path: string; message: string; frame?: string } => r !== null);
+  }
+
   async installDependencies(): Promise<{ ok: boolean; log: string }> {
     const res = await this.run(['npm', 'install', '--no-audit', '--no-fund'], 300_000);
     const log = (res.stdout + res.stderr).slice(-4000);
