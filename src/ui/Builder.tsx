@@ -1,7 +1,8 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FileChange, TurnEvent } from '@/agent/types';
+import { dedupeErrors, isFailureEvent, parsePreviewEvent, toPreviewError, type PreviewError, type PreviewEvent } from '@/preview/events';
 import type { SandboxStatus } from '@/sandbox/types';
 import { ChatPane } from './ChatPane';
 import { FileTree } from './FileTree';
@@ -24,13 +25,16 @@ interface BuilderProps {
   previewUrl: string;
   initialMessages: ChatMessage[];
   initialFiles: string[];
+  initialCredits: number;
 }
 
 let seq = 0;
 const nextId = () => `m${Date.now().toString(36)}${(seq++).toString(36)}`;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function Builder({ project, provider, model, previewUrl, initialMessages, initialFiles }: BuilderProps) {
+export function Builder({ project, provider, model, previewUrl, initialMessages, initialFiles, initialCredits }: BuilderProps) {
   const projectId = project.id;
+  const previewOrigin = useMemo(() => new URL(previewUrl).origin, [previewUrl]);
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [files, setFiles] = useState<string[]>(initialFiles);
   const [marks, setMarks] = useState<Record<string, FileChange>>({});
@@ -39,7 +43,13 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
   const [busy, setBusy] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [versionsKey, setVersionsKey] = useState(0);
+  const [credits, setCredits] = useState(initialCredits);
+  const [idleErrors, setIdleErrors] = useState<PreviewError[]>([]);
   const abortRef = useRef<AbortController | null>(null);
+  const busyRef = useRef(false);
+  // Everything the preview posted, with arrival times; each attempt reports what came after its change.
+  const eventsRef = useRef<{ at: number; raw: unknown; event: PreviewEvent }[]>([]);
+  const attemptStartRef = useRef(0);
 
   // Warm the sandbox on load so it is hot before the first message is sent.
   useEffect(() => {
@@ -57,6 +67,30 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
       cancelled = true;
     };
   }, [projectId]);
+
+  // The preview reports failures and RENDER_OK by postMessage. Only its own
+  // origin may, and the payload is untrusted generated code (parsePreviewEvent).
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.origin !== previewOrigin) return;
+      const event = parsePreviewEvent(e.data);
+      if (!event) return;
+      const log = eventsRef.current;
+      log.push({ at: Date.now(), raw: e.data, event });
+      if (log.length > 300) log.splice(0, log.length - 200);
+      if (busyRef.current) return;
+      // Between turns, a failure offers "Fix it"; a clean render clears it.
+      const error = toPreviewError(event, previewOrigin);
+      if (error) setIdleErrors((prev) => dedupeErrors([...prev, error]).slice(0, 3));
+      else if (event.type === 'RENDER_OK') setIdleErrors([]);
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [previewOrigin]);
+
+  useEffect(() => {
+    setIdleErrors([]);
+  }, [previewKey]);
 
   const updateTurn = useCallback((id: string, fn: (t: AssistantTurn) => AssistantTurn) => {
     setMessages((prev) => prev.map((m) => (m.id === id && m.role === 'assistant' ? fn(m) : m)));
@@ -82,32 +116,77 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
     setMarks((prev) => ({ ...prev, [e.path]: prev[e.path] === 'created' || e.change === 'renamed' ? 'created' : e.change }));
   }, []);
 
+  /**
+   * 9 COLLECT, page side: watch the preview after the change, then report what
+   * it said. A failure ends the watch early (after its companion reports
+   * arrive); so does RENDER_OK on a fresh load.
+   */
+  const reportPreview = useCallback(async (turnId: string, attempt: number, windowMs: number, remounted: boolean) => {
+    const start = attemptStartRef.current;
+    const seen = () => eventsRef.current.filter((x) => x.at >= start);
+    const deadline = Date.now() + windowMs;
+    while (Date.now() < deadline) {
+      await sleep(150);
+      if (seen().some((x) => isFailureEvent(x.event))) {
+        await sleep(600);
+        break;
+      }
+      if (remounted && seen().some((x) => x.event.type === 'RENDER_OK')) break;
+    }
+    await fetch(`/api/turns/${turnId}/report`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ attempt, events: seen().map((x) => x.raw) }),
+    }).catch(() => undefined);
+  }, []);
+
   const send = useCallback(
-    async (text: string) => {
+    async (text: string, repairOf?: PreviewError) => {
       const turnId = nextId();
       setMessages((prev) => [...prev, { id: nextId(), role: 'user', text }, newAssistantTurn(turnId)]);
       setMarks({});
+      setIdleErrors([]);
       setBusy(true);
+      busyRef.current = true;
       const abort = new AbortController();
       abortRef.current = abort;
       try {
         const res = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ projectId, message: text }),
+          body: JSON.stringify({ projectId, message: text, previewReports: true, repairOf }),
           signal: abort.signal,
         });
         if (!res.ok || !res.body) throw new Error(`Request failed (${res.status})`);
         for await (const event of readTurnEvents(res.body)) {
           updateTurn(turnId, (t) => applyTurnEvent(t, event));
-          if (event.type === 'file') trackFile(event);
-          else if (event.type === 'checkpoint') setVersionsKey((k) => k + 1);
-          else if (event.type === 'sandbox') {
-            setSandbox({ status: event.status, detail: event.detail, error: event.status === 'crashed' ? event.detail : undefined });
-          } else if (event.type === 'preview-reload') {
-            setPreviewKey((k) => k + 1);
-          } else if (event.type === 'error' && /Docker|sandbox/i.test(event.message)) {
-            setSandbox({ status: 'crashed', error: event.message });
+          switch (event.type) {
+            case 'file':
+              trackFile(event);
+              break;
+            case 'checkpoint':
+              setVersionsKey((k) => k + 1);
+              break;
+            case 'stage':
+              if (event.stage === 'execute') attemptStartRef.current = Date.now();
+              break;
+            case 'collect':
+              void reportPreview(event.turnId, event.attempt, event.windowMs, event.remounted);
+              break;
+            case 'meter':
+              setCredits(event.balance);
+              break;
+            case 'sandbox':
+              setSandbox({ status: event.status, detail: event.detail, error: event.status === 'crashed' ? event.detail : undefined });
+              break;
+            case 'preview-reload':
+              setPreviewKey((k) => k + 1);
+              break;
+            case 'error':
+              if (/Docker|sandbox/i.test(event.message)) setSandbox({ status: 'crashed', error: event.message });
+              break;
+            default:
+              break;
           }
         }
       } catch (err) {
@@ -115,10 +194,11 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
         updateTurn(turnId, (t) => ({ ...t, status: stopped ? 'stopped' : 'failed', error: stopped ? undefined : (err as Error).message }));
       } finally {
         setBusy(false);
+        busyRef.current = false;
         abortRef.current = null;
       }
     },
-    [projectId, updateTurn, trackFile],
+    [projectId, updateTurn, trackFile, reportPreview],
   );
 
   // A project started from the home page arrives with its first request waiting.
@@ -157,8 +237,26 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
     [projectId],
   );
 
+  const rollback = useCallback(
+    (sha: string) => {
+      restore(sha).catch((err: Error) =>
+        setMessages((prev) => [...prev, { ...newAssistantTurn(nextId()), status: 'failed', error: `Could not roll back: ${err.message}` }]),
+      );
+    },
+    [restore],
+  );
+
+  /** "Fix it" on a failure the preview showed between turns: a repair turn, never billed. */
+  const fixIdle = useCallback(() => {
+    const error = idleErrors[0];
+    if (error && !busyRef.current) void send('Fix the error in the preview', error);
+  }, [idleErrors, send]);
+
   const lastTurn = [...messages].reverse().find((m): m is AssistantTurn => m.role === 'assistant');
-  const writing = lastTurn?.status === 'streaming' ? lastTurn.files.find((f) => f.status === 'writing')?.path : undefined;
+  const streaming = lastTurn?.status === 'streaming';
+  const writing = streaming ? lastTurn?.files.find((f) => f.status === 'writing')?.path : undefined;
+  const liveRepair = streaming ? lastTurn?.repairs?.find((r) => r.status === 'fixing') : undefined;
+  const turnErrors = lastTurn && (streaming || lastTurn.status === 'failed') ? lastTurn.errors : undefined;
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-bg text-text">
@@ -166,6 +264,7 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
         project={project}
         provider={provider}
         model={model}
+        credits={credits}
         historyOpen={historyOpen}
         onToggleHistory={() => setHistoryOpen((open) => !open)}
       />
@@ -173,7 +272,7 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
         {historyOpen ? (
           <HistoryPanel projectId={projectId} refreshKey={versionsKey} busy={busy} onRestore={restore} onClose={() => setHistoryOpen(false)} />
         ) : (
-          <ChatPane messages={messages} busy={busy} onSend={send} onStop={stop} />
+          <ChatPane messages={messages} busy={busy} onSend={send} onStop={stop} onRollback={rollback} />
         )}
         <FileTree files={files} marks={marks} writing={writing} />
         <PreviewPane
@@ -182,6 +281,10 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
           sandbox={sandbox}
           onReload={() => setPreviewKey((k) => k + 1)}
           lastUsage={[...messages].reverse().find((m): m is AssistantTurn => m.role === 'assistant' && !!m.usage)?.usage}
+          repair={liveRepair}
+          errors={turnErrors}
+          idleError={busy ? undefined : idleErrors[0]}
+          onFix={fixIdle}
         />
       </div>
     </div>
