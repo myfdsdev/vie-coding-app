@@ -209,7 +209,9 @@ class GeminiProvider implements ModelProvider {
         model,
         stopReason,
         usage: {
-          inputTokens: usage?.promptTokenCount ?? 0,
+          // Uncached input only, like Anthropic's input_tokens: Gemini's prompt count
+          // includes the cached part, which cacheReadTokens already carries.
+          inputTokens: Math.max(0, (usage?.promptTokenCount ?? 0) - (usage?.cachedContentTokenCount ?? 0)),
           // Gemini 3 models think before answering; thinking is billed as output.
           outputTokens: (usage?.candidatesTokenCount ?? 0) + (usage?.thoughtsTokenCount ?? 0),
           cacheReadTokens: usage?.cachedContentTokenCount ?? 0,
