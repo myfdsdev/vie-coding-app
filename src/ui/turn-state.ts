@@ -39,12 +39,32 @@ export interface AssistantTurn {
   durationMs?: number;
   /** The version this turn was saved as (git checkpoint). */
   version?: { number: number; sha: string };
+  turnId?: string;
+  /** Automatic repairs in this turn, oldest first. Absent on turns saved before M2. */
+  repairs?: RepairRow[];
+  /** Failures found by the latest check of the preview (empty once it works). */
+  errors?: PreviewError[];
+  /** Set when the repair budget ran out with the preview still failing. */
+  failure?: { error: PreviewError; cause: string; attempts: number; rollback?: { number: number; sha: string } };
+  meter?: { billed: number; free: number; balance: number };
+}
+
+export interface RepairRow {
+  round: number;
+  attempt: number;
+  of: number;
+  signature: string;
+  cause: string;
+  action: string;
+  stuck: boolean;
+  error: PreviewError;
+  status: 'fixing' | 'fixed' | 'failed';
 }
 
 export type ChatMessage = UserMessage | AssistantTurn;
 
 export function newAssistantTurn(id: string): AssistantTurn {
-  return { id, role: 'assistant', status: 'streaming', plan: '', summary: '', files: [], dependencies: [], warnings: [] };
+  return { id, role: 'assistant', status: 'streaming', plan: '', summary: '', files: [], dependencies: [], warnings: [], repairs: [] };
 }
 
 const STAGE_LABEL: Record<string, string> = {
@@ -53,13 +73,37 @@ const STAGE_LABEL: Record<string, string> = {
   apply: 'Saving files',
   checkpoint: 'Saving a version',
   execute: 'Updating the preview',
+  collect: 'Checking the preview',
 };
+
+/** Close the repair in progress: fixed, or it did not hold. */
+function settleRepairs(repairs: RepairRow[] | undefined, status: 'fixed' | 'failed', unlessSignature?: string): RepairRow[] {
+  return (repairs ?? []).map((r) =>
+    r.status !== 'fixing' ? r : { ...r, status: unlessSignature !== undefined && r.signature !== unlessSignature ? 'fixed' : status },
+  );
+}
 
 /** Pure reducer: fold one server event into the assistant turn it belongs to. */
 export function applyTurnEvent(turn: AssistantTurn, e: TurnEvent): AssistantTurn {
   switch (e.type) {
     case 'turn-start':
-      return { ...turn, model: e.model };
+      return { ...turn, model: e.model, turnId: e.turnId };
+    case 'check':
+      return { ...turn, errors: e.errors, repairs: e.errors.length ? turn.repairs : settleRepairs(turn.repairs, 'fixed') };
+    case 'repair': {
+      // A new round on the same failure means the last fix did not hold; a different failure means it did.
+      const earlier = settleRepairs(turn.repairs, 'failed', e.signature);
+      const row: RepairRow = { round: e.round, attempt: e.attempt, of: e.of, signature: e.signature, cause: e.cause, action: e.action, stuck: e.stuck, error: e.error, status: 'fixing' };
+      return { ...turn, repairs: [...earlier, row] };
+    }
+    case 'repair-stopped':
+      return {
+        ...turn,
+        repairs: settleRepairs(turn.repairs, 'failed'),
+        failure: { error: e.error, cause: e.cause, attempts: e.attempts, rollback: e.rollback },
+      };
+    case 'meter':
+      return { ...turn, meter: { billed: e.billed, free: e.free, balance: e.balance } };
     case 'stage':
       return { ...turn, stage: e.detail ?? STAGE_LABEL[e.stage] ?? e.stage };
     case 'checkpoint':
