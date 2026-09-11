@@ -54,28 +54,58 @@ function connectDocker(): Docker {
 /** Actionable error text for the three setup steps people skip. */
 export class SandboxSetupError extends Error {}
 
-/** HTTP status of the preview as seen through the gateway, or 0 if unreachable. */
-function probePreview(projectId: string, timeoutMs = 3000): Promise<number> {
+/** A request to the project's dev server through the gateway. Status 0: unreachable. */
+function previewRequest(projectId: string, path: string, timeoutMs: number): Promise<{ status: number; body: string }> {
   const gw = gatewayUrl();
   return new Promise((resolve) => {
     const req = http.request(
       {
         host: gw.hostname,
         port: gw.port || 80,
-        path: '/',
+        path,
         method: 'GET',
-        headers: { host: `${previewHost(projectId)}:${publicPort()}` },
+        headers: { host: `${previewHost(projectId)}:${publicPort()}`, accept: '*/*' },
         timeout: timeoutMs,
       },
       (res) => {
-        res.resume();
-        resolve(res.statusCode ?? 0);
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on('data', (c: Buffer) => {
+          if (size < 200_000) chunks.push(c);
+          size += c.length;
+        });
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+        res.on('error', () => resolve({ status: 0, body: '' }));
       },
     );
     req.on('timeout', () => req.destroy());
-    req.on('error', () => resolve(0));
+    req.on('error', () => resolve({ status: 0, body: '' }));
     req.end();
   });
+}
+
+/** HTTP status of the preview as seen through the gateway, or 0 if unreachable. */
+async function probePreview(projectId: string, timeoutMs = 3000): Promise<number> {
+  return (await previewRequest(projectId, '/', timeoutMs)).status;
+}
+
+/**
+ * Vite answers a module it cannot build with HTTP 500 and an HTML page that
+ * embeds the error as JSON (`const error = {...}` in Vite 5). Returns the
+ * message and code frame, or the page's text if the format is unfamiliar.
+ */
+export function viteError(body: string): { message: string; frame?: string } {
+  const json = body.match(/const error = (\{.*\})\s*$/m)?.[1] ?? body.match(/new ErrorOverlay\((\{.*\})\)/)?.[1];
+  if (json) {
+    try {
+      const err = JSON.parse(json) as { message?: string; frame?: string };
+      if (err.message) return { message: err.message.slice(0, 1000), frame: err.frame?.slice(0, 1500) };
+    } catch {
+      /* fall through to the page text */
+    }
+  }
+  const text = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return { message: text.slice(0, 500) || 'The dev server could not build this file.' };
 }
 
 class DockerSandbox implements Sandbox {

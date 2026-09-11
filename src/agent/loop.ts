@@ -1,8 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { dedupeErrors, toPreviewError, type PreviewError } from '../preview/events';
+import { waitForReport } from '../preview/reports';
 import { ensureSandbox, waitForReady } from '../sandbox';
 import type { Sandbox } from '../sandbox/types';
 import { appendHistory, getHistory, takePendingNote } from '../store/chats';
-import { checkpoint, ensureRepo } from '../store/checkpoints';
+import { checkpoint, ensureRepo, listVersions } from '../store/checkpoints';
+import { recordUsage, settleTurn, type LedgerKind } from '../store/meter';
 import {
   PROTECTED_PATHS,
   deleteProjectFile,
@@ -17,19 +20,25 @@ import {
   writeProjectFile,
 } from '../store/projects';
 import { applyEdit } from './apply-edit';
+import { LoopBudget } from './budget';
 import { buildContext, historyEntryFor } from './context';
+import { buildFixPrompt, diagnoseError, referencedFiles } from './diagnose';
 import { ChangesParser, type ChangeOp, type ParseEvent } from './parser';
 import { SYSTEM_PROMPT } from './prompt';
 import { getProvider, type ModelMessage, type ModelProvider, type ModelUsage } from './providers';
 import type { FileChange, TurnEvent } from './types';
 
 /**
- * The agent turn (BUILD-PROMPT §7), M1 scope.
+ * The agent turn (BUILD-PROMPT §7), M2 scope.
  *
- * Stages here: 2 CONTEXT, 3 PLAN+EMIT, 5 APPLY (whole files and placed
- * edits), 7 CHECKPOINT (a git commit per turn) and 8 EXECUTE. ROUTE, STREAM
- * FIX, VALIDATE, COLLECT, DECIDE and METER arrive in M2-M3 at the positions
- * their numbers indicate.
+ *   2 CONTEXT, then per attempt: 3 PLAN+EMIT, 5 APPLY, 7 CHECKPOINT,
+ *   8 EXECUTE, 9 COLLECT, 10 DECIDE; finally 11 METER.
+ *
+ * DECIDE is deterministic: a clean check ends the turn, and LoopBudget — never
+ * the model — ends a failing one. Repairs and retries are recorded but never
+ * billed; the build is billed only when the turn ends with a working preview.
+ * ROUTE, STREAM FIX and VALIDATE arrive in M3 at the positions their numbers
+ * indicate.
  */
 
 export interface TurnInput {
@@ -37,6 +46,10 @@ export interface TurnInput {
   message: string;
   emit: (event: TurnEvent) => void;
   signal: AbortSignal;
+  /** The builder page reports what the preview shows after each change. Without it only the build check runs. */
+  previewReports?: boolean;
+  /** "Fix it" from the preview: repair this failure instead of building from the message. */
+  repairOf?: PreviewError;
 }
 
 interface Applied {
@@ -58,19 +71,45 @@ interface Pass {
   model: string;
 }
 
-export async function runTurn({ projectId, message, emit, signal }: TurnInput): Promise<void> {
+type Outcome = 'success' | 'failed' | 'stopped' | 'answered';
+
+export async function runTurn(input: TurnInput): Promise<void> {
+  const { projectId, message, emit, signal } = input;
   const started = Date.now();
   const turnId = randomUUID();
   const provider = getProvider();
+  const budget = new LoopBudget();
   emit({ type: 'turn-start', turnId, provider: provider.name, model: provider.modelFor('code') });
 
-  let filesChanged = 0;
+  const touched = new Set<string>();
+  const calls: { kind: LedgerKind; attempt: number; model: string; usage: ModelUsage | null }[] = [];
+  let outcome: Outcome = 'failed';
+  let record: { user: string; response: string; problem?: string } | null = null;
+  let errors: PreviewError[] = input.repairOf ? [input.repairOf] : [];
+  let rounds = 0;
+
+  /** Start a repair round for a failure: count it, show it, return the label for its model call. */
+  const startRepair = (error: PreviewError): string => {
+    budget.record(error);
+    rounds++;
+    const d = diagnoseError(error);
+    const attempt = budget.attempts(error);
+    const stuck = budget.isStuck(error);
+    emit({ type: 'repair', round: rounds, attempt, of: budget.maxPerSignature, signature: budget.signature(error), cause: d.cause, action: d.action, stuck, error });
+    return `Attempt ${attempt} of ${budget.maxPerSignature} — ${d.action}`;
+  };
+
   try {
     await ensureWorkspace(projectId);
     ensureProject(projectId);
-    touchProject(projectId, projectNameFrom(message));
+    touchProject(projectId, input.repairOf ? undefined : projectNameFrom(message));
     // v1 must be the state before this turn, or the turn's changes would vanish into it.
     await ensureRepo(projectId).catch((err: Error) => emit({ type: 'warning', message: `Version history is unavailable: ${err.message}` }));
+    // Offered as the way back if this turn's repairs run out.
+    const rollback = await listVersions(projectId).then(
+      (v) => (v[0] ? { number: v[0].number, sha: v[0].sha } : undefined),
+      () => undefined,
+    );
 
     // Boot (or resume) the sandbox now, in parallel with the model call —
     // the user should never wait for a cold start after the code is written.
@@ -85,90 +124,202 @@ export async function runTurn({ projectId, message, emit, signal }: TurnInput): 
     // 2 CONTEXT — cache-stable: system prompt, files sorted by path, history, message
     emit({ type: 'stage', stage: 'context' });
     const note = takePendingNote(projectId);
-    const userContent = note ? `[${note}]\n\n${message}` : message;
-    const conversation: ModelMessage[] = [...getHistory(projectId), { role: 'user', content: userContent }];
-
-    // 3 PLAN+EMIT and 5 APPLY
-    const first = await modelPass({ projectId, provider, conversation, emit, signal });
-    let applied = first.applied;
-    const problems = [...first.problems];
-    const usages = [first.usage];
-
-    // An <edit> that cannot be placed exactly is asked for once more as a
-    // whole file (§6c), never applied approximately.
-    if (applied.failedEdits.length) {
-      const retry = await modelPass({
-        projectId,
-        provider,
-        emit,
-        signal,
-        conversation: [
-          ...conversation,
-          { role: 'assistant', content: first.response },
-          { role: 'user', content: wholeFilePrompt(applied.failedEdits) },
-        ],
-        label: `Rewriting ${applied.failedEdits.map((f) => f.path).join(', ')} in full`,
-      });
-      usages.push(retry.usage);
-      problems.push(...retry.problems);
-      applied = mergeApplied(applied, retry.applied);
-    }
-    filesChanged = applied.touched.length;
-    const usage = sumUsage(usages);
-    if (usage) emit({ type: 'usage', model: first.model, ...usage });
-
-    // The model sent changes but none could be used: say so rather than let its
-    // own "done" sentence stand, and tell the model in its history.
-    const nothingApplied = first.sawChanges && applied.touched.length === 0 && problems.length > 0;
-    appendHistory(projectId, [
-      { role: 'user', content: userContent },
-      { role: 'assistant', content: historyEntryFor(first.response, applied.touched, nothingApplied ? problems.join('; ') : undefined) },
-    ]);
-    if (nothingApplied) {
-      throw new Error("The AI's reply contained changes Forge couldn't use, so nothing in your app changed. Send your message again.");
+    const noted = (text: string) => (note ? `[${note}]\n\n${text}` : text);
+    const userContent = noted(input.repairOf ? `Fix the error the preview shows: ${input.repairOf.message}` : message);
+    const conversation: ModelMessage[] = [...getHistory(projectId)];
+    let label: string | undefined;
+    if (input.repairOf) {
+      label = startRepair(input.repairOf);
+      conversation.push({ role: 'user', content: noted(await fixPrompt(projectId, input.repairOf, false)) });
+    } else {
+      conversation.push({ role: 'user', content: userContent });
     }
 
-    // 7 CHECKPOINT — a git commit before the sandbox ever sees the change
-    if (applied.touched.length) {
-      emit({ type: 'stage', stage: 'checkpoint' });
-      try {
-        const version = await checkpoint(projectId, { subject: message, kind: 'turn', turnId });
-        if (version) emit({ type: 'checkpoint', version: version.number, sha: version.sha, subject: version.subject });
-      } catch (err) {
-        emit({ type: 'warning', message: `This change was not saved as a version: ${(err as Error).message}` });
+    let wasServing: boolean | undefined;
+    for (let attempt = 0; ; attempt++) {
+      const repairing = attempt > 0 || !!input.repairOf;
+
+      // 3 PLAN+EMIT and 5 APPLY
+      const pass = await modelPass({ projectId, provider, conversation, emit, signal, label });
+      calls.push({ kind: repairing ? 'repair' : 'build', attempt, model: pass.model, usage: pass.usage });
+      let applied = pass.applied;
+      const problems = [...pass.problems];
+      // An <edit> that cannot be placed exactly is asked for once more as a
+      // whole file (§6c), never applied approximately.
+      if (applied.failedEdits.length) {
+        const retry = await modelPass({
+          projectId,
+          provider,
+          emit,
+          signal,
+          conversation: [...conversation, { role: 'assistant', content: pass.response }, { role: 'user', content: wholeFilePrompt(applied.failedEdits) }],
+          label: `Rewriting ${applied.failedEdits.map((f) => f.path).join(', ')} in full`,
+        });
+        calls.push({ kind: 'retry', attempt, model: retry.model, usage: retry.usage });
+        problems.push(...retry.problems);
+        applied = mergeApplied(applied, retry.applied);
       }
-    }
+      conversation.push({ role: 'assistant', content: pass.response });
+      for (const path of applied.touched) touched.add(path);
 
-    // 8 EXECUTE — push the change into the sandbox and wait for the dev server
-    emit({ type: 'stage', stage: 'execute' });
-    const sandbox = await sandboxPromise;
-    const wasServing = await servingBefore;
-    // The preview pane unmounts the iframe while the sandbox is not ready, so
-    // announcing a start for a server that is already serving would reload the
-    // preview mid-write — the same race needsPreviewRemount() avoids.
-    if (!wasServing) emit({ type: 'sandbox', status: 'starting', detail: 'Starting the sandbox' });
-    await syncToSandbox(sandbox, applied, emit);
-    const status = await waitForReady(sandbox, 90_000);
-    // 'ready' can mount the iframe for the first time (e.g. after a failed
-    // warm-up) and a remount may follow it. Neither may load before Vite's
-    // polling watcher has invalidated the files just written, or the page gets
-    // their previous version from Vite's cache.
-    if (status === 'ready' && applied.touched.length) await new Promise((r) => setTimeout(r, WATCHER_SETTLE_MS));
-    emit({ type: 'sandbox', status, previewUrl: sandbox.previewUrl(), detail: status === 'ready' ? 'Preview ready' : `Sandbox ${status}` });
-    if (status !== 'ready') throw new Error(`The sandbox did not become ready (${status}).`);
-    if (needsPreviewRemount({ filesChanged: applied.touched.length > 0, wasServing, dependenciesChanged: applied.dependenciesChanged })) {
-      emit({ type: 'preview-reload' });
-    }
+      if (attempt === 0) {
+        // The model sent changes but none could be used: say so rather than let
+        // its own "done" sentence stand, and tell the model in its history.
+        const nothingApplied = pass.sawChanges && applied.touched.length === 0 && problems.length > 0;
+        record = { user: userContent, response: pass.response, problem: nothingApplied ? problems.join('; ') : undefined };
+        if (!repairing) {
+          if (nothingApplied) {
+            throw new Error("The AI's reply contained changes Forge couldn't use, so nothing in your app changed. Send your message again.");
+          }
+          if (!pass.sawChanges) {
+            outcome = 'answered'; // a plain answer: no code changed, nothing to check
+            break;
+          }
+        }
+      }
 
-    emit({ type: 'turn-end', outcome: first.sawChanges ? 'success' : 'answered', durationMs: Date.now() - started, filesChanged });
+      if (applied.touched.length) {
+        // 7 CHECKPOINT — a git commit before the sandbox ever sees the change
+        emit({ type: 'stage', stage: 'checkpoint' });
+        try {
+          const version = await checkpoint(
+            projectId,
+            repairing ? { subject: `Fix: ${errors[0]?.message ?? 'preview error'}`, kind: 'repair', turnId } : { subject: message, kind: 'turn', turnId },
+          );
+          if (version) emit({ type: 'checkpoint', version: version.number, sha: version.sha, subject: version.subject });
+        } catch (err) {
+          emit({ type: 'warning', message: `This change was not saved as a version: ${(err as Error).message}` });
+        }
+
+        // 8 EXECUTE — push the change into the sandbox and wait for the dev server
+        emit({ type: 'stage', stage: 'execute' });
+        const sandbox = await sandboxPromise;
+        wasServing ??= await servingBefore;
+        // The preview pane unmounts the iframe while the sandbox is not ready, so
+        // announcing a start for a server that is already serving would reload
+        // the preview mid-write — the same race needsPreviewRemount() avoids.
+        if (!wasServing && attempt === 0) emit({ type: 'sandbox', status: 'starting', detail: 'Starting the sandbox' });
+        await syncToSandbox(sandbox, applied, emit);
+        const status = await waitForReady(sandbox, 90_000);
+        // 'ready' can mount the iframe for the first time and a remount may
+        // follow it. Neither may load before Vite's polling watcher has
+        // invalidated the files just written, or the page gets their previous
+        // version from Vite's cache.
+        if (status === 'ready') await new Promise((r) => setTimeout(r, WATCHER_SETTLE_MS));
+        emit({ type: 'sandbox', status, previewUrl: sandbox.previewUrl(), detail: status === 'ready' ? 'Preview ready' : `Sandbox ${status}` });
+        if (status !== 'ready') throw new Error(`The sandbox did not become ready (${status}).`);
+        // A repair is verified on a fresh page load: an error boundary that caught
+        // the old crash would otherwise keep showing it.
+        const remount = repairing || needsPreviewRemount({ filesChanged: true, wasServing, dependenciesChanged: applied.dependenciesChanged });
+        if (remount) emit({ type: 'preview-reload' });
+
+        // 9 COLLECT
+        errors = await collect({ sandbox, turnId, attempt, applied, remounted: remount, emit, signal, previewReports: !!input.previewReports });
+      }
+      // A repair that changed nothing leaves the failure as it was.
+      emit({ type: 'check', attempt, errors: errors.slice(0, 3) });
+
+      // 10 DECIDE
+      if (!errors.length) {
+        outcome = 'success';
+        break;
+      }
+      const primary = errors[0];
+      if (!budget.canRetry(primary)) {
+        emit({ type: 'repair-stopped', error: primary, cause: diagnoseError(primary).cause, attempts: budget.attempts(primary), rollback });
+        outcome = 'failed';
+        break;
+      }
+      label = startRepair(primary);
+      conversation.push({ role: 'user', content: await fixPrompt(projectId, primary, budget.isStuck(primary)) });
+    }
   } catch (err) {
-    if (signal.aborted) {
-      emit({ type: 'turn-end', outcome: 'stopped', durationMs: Date.now() - started, filesChanged });
-      return;
+    if (signal.aborted) outcome = 'stopped';
+    else {
+      emit({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+      outcome = 'failed';
     }
-    emit({ type: 'error', message: err instanceof Error ? err.message : String(err) });
-    emit({ type: 'turn-end', outcome: 'failed', durationMs: Date.now() - started, filesChanged });
   }
+
+  // The request and a condensed reply, so later turns know what happened (append-only).
+  if (record) {
+    const repairNote =
+      rounds === 0
+        ? ''
+        : outcome === 'success'
+          ? `\n[the preview failed after this change and was repaired automatically in ${rounds} attempt${rounds === 1 ? '' : 's'}]`
+          : `\n[the preview still fails: ${errors[0]?.message ?? 'unknown error'} — automatic repair stopped]`;
+    try {
+      appendHistory(projectId, [
+        { role: 'user', content: record.user },
+        { role: 'assistant', content: historyEntryFor(record.response, [...touched], record.problem) + repairNote },
+      ]);
+    } catch (err) {
+      console.error('[forge] could not save the model history', err);
+    }
+  }
+
+  // 11 METER — every call is recorded; only a turn that leaves a working preview pays for its build.
+  const total = sumUsage(calls.map((c) => c.usage));
+  if (total) emit({ type: 'usage', model: calls[0]?.model ?? provider.modelFor('code'), ...total });
+  try {
+    for (const c of calls) if (c.usage) recordUsage({ projectId, turnId, attempt: c.attempt, kind: c.kind, model: c.model, usage: c.usage });
+    emit({ type: 'meter', ...settleTurn(turnId, outcome === 'success' || outcome === 'answered') });
+  } catch (err) {
+    console.error('[forge] could not record usage', err);
+  }
+
+  emit({ type: 'turn-end', outcome, durationMs: Date.now() - started, filesChanged: touched.size });
+}
+
+/** Files the build check asks the dev server to compile. */
+const BUILDABLE = /^src\/.+\.(?:tsx?|jsx?|css)$/;
+
+/**
+ * 9 COLLECT: build errors from the dev server itself (deterministic, needs no
+ * browser), then — if nothing failed to build — what the preview reported
+ * through the builder page within its watch window.
+ */
+async function collect(o: {
+  sandbox: Sandbox;
+  turnId: string;
+  attempt: number;
+  applied: Applied;
+  remounted: boolean;
+  emit: (e: TurnEvent) => void;
+  signal: AbortSignal;
+  previewReports: boolean;
+}): Promise<PreviewError[]> {
+  o.emit({ type: 'stage', stage: 'collect' });
+  const found: PreviewError[] = [];
+  const code = o.applied.written.map((w) => w.path).filter((p) => BUILDABLE.test(p));
+  if (o.sandbox.buildCheck && code.length) {
+    for (const f of await o.sandbox.buildCheck([...new Set([...code, 'src/main.tsx'])])) {
+      found.push({ type: 'BUILD_ERROR', message: f.message, frame: f.frame, file: f.path });
+    }
+  }
+  if (!found.length && o.previewReports) {
+    // A fresh page load needs time for the shim's RENDER_OK (2.5s after load).
+    const windowMs = o.remounted ? 4000 : 2500;
+    o.emit({ type: 'collect', turnId: o.turnId, attempt: o.attempt, windowMs, remounted: o.remounted });
+    const events = await waitForReport(o.turnId, o.attempt, windowMs + 8000, o.signal);
+    const origin = new URL(o.sandbox.previewUrl()).origin;
+    for (const e of events ?? []) {
+      const error = toPreviewError(e, origin);
+      if (error) found.push(error);
+    }
+  }
+  return dedupeErrors(found);
+}
+
+/** The §10 fix prompt, with the files the failure points at. */
+async function fixPrompt(projectId: string, error: PreviewError, stuck: boolean): Promise<string> {
+  const files: { path: string; content: string }[] = [];
+  for (const path of referencedFiles(error)) {
+    const content = await readProjectFile(projectId, path).catch(() => null);
+    if (content !== null) files.push({ path, content });
+  }
+  return buildFixPrompt(error, diagnoseError(error), files, { stuck });
 }
 
 /** 3 PLAN+EMIT and 5 APPLY for one model call. */
@@ -178,7 +329,7 @@ async function modelPass(opts: {
   conversation: ModelMessage[];
   emit: (e: TurnEvent) => void;
   signal: AbortSignal;
-  /** Set for the whole-file retry, whose prose stays out of the chat; only its files show. */
+  /** Set for repairs and whole-file retries, whose prose stays out of the chat; only their files show. */
   label?: string;
 }): Promise<Pass> {
   const { projectId, provider, conversation, emit, signal, label } = opts;

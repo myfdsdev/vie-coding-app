@@ -9,9 +9,23 @@ import { applyTurnEvent, newAssistantTurn, type UserMessage } from '@/ui/turn-st
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+/** A failure the builder page asks Forge to fix ("Fix it"). It came from generated code, so it is capped. */
+const PreviewErrorSchema = z.object({
+  type: z.enum(['BUILD_ERROR', 'REACT_RENDER_ERROR', 'UNCAUGHT_EXCEPTION', 'UNHANDLED_REJECTION', 'BLANK_SCREEN']),
+  message: z.string().max(1000),
+  stack: z.string().max(4000).optional(),
+  componentStack: z.string().max(4000).optional(),
+  frame: z.string().max(1500).optional(),
+  file: z.string().max(300).optional(),
+  line: z.number().int().optional(),
+});
+
 const Body = z.object({
   projectId: z.string(),
   message: z.string().trim().min(1).max(20_000),
+  /** The page will report what the preview shows after each change. */
+  previewReports: z.boolean().optional(),
+  repairOf: PreviewErrorSchema.optional(),
 });
 
 /** SSE endpoint: one agent turn, streamed as TurnEvents and saved to the chat when it ends. */
@@ -20,7 +34,7 @@ export async function POST(req: Request) {
   if (!parsed.success || !isProjectId(parsed.data.projectId)) {
     return Response.json({ error: 'Expected { projectId, message }' }, { status: 400 });
   }
-  const { projectId, message } = parsed.data;
+  const { projectId, message, previewReports, repairOf } = parsed.data;
 
   const abort = new AbortController();
   req.signal.addEventListener('abort', () => abort.abort());
@@ -42,7 +56,7 @@ export async function POST(req: Request) {
           open = false;
         }
       };
-      await runTurn({ projectId, message, emit, signal: abort.signal });
+      await runTurn({ projectId, message, emit, signal: abort.signal, previewReports, repairOf });
       try {
         appendMessages(projectId, [user, turn]);
       } catch (err) {

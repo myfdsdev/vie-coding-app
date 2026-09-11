@@ -2,21 +2,141 @@ import type { ModelRequest } from './providers';
 
 /**
  * Canned model output for PROVIDER=mock. It exercises the real pipeline —
- * streaming parse, file writes, edits, checkpoints, sandbox sync, preview —
- * with no API key.
+ * streaming parse, file writes, edits, checkpoints, sandbox sync, preview and
+ * the repair loop — with no API key.
  *
- * The first build request in a project always produces the same small task
- * app (titled from the user's words). A follow-up request gets one demo
- * change, sent as an <edit>: the header badge swaps colour. If the loop
- * reports that an edit could not be placed, the mock sends the whole file.
+ * - A first build request: a small task app, titled from the user's words.
+ * - A follow-up request: one demo change sent as an <edit> (the header badge
+ *   swaps colour), or the whole file if the loop reports it could not be placed.
+ * - A request mentioning "data.map" or rendering before the data loads: a
+ *   recipe list that crashes on its first render, and a real fix when the
+ *   repair loop asks. With "unfixable" in the request, the fixes never work,
+ *   which exercises the repair budget.
  */
 export function mockResponse(req: ModelRequest): string {
   const last = req.messages[req.messages.length - 1]?.content ?? '';
+  if (last.includes('The app failed with the following error.')) return recipeRepair(req.context, last);
+  if (BREAKING_REQUEST.test(last)) return recipeApp(/unfixable/i.test(last));
   if (req.context.includes('src/hooks/useTasks.ts')) {
     const color: Badge = req.context.includes(`rounded-xl ${BADGE.rose}`) ? 'indigo' : 'rose';
     return /could not be placed exactly/.test(last) ? headerRewrite(color) : headerEdit(color);
   }
   return taskApp(titleFrom(last), last);
+}
+
+const BREAKING_REQUEST = /data\.map|before the (?:fetch|data)|unfixable/i;
+const UNFIXABLE_MARK = '// forge-mock: unfixable';
+
+const RECIPES_LIB = `export interface Recipe {
+  id: string;
+  title: string;
+  minutes: number;
+  tag: string;
+}
+
+const RECIPES: Recipe[] = [
+  { id: 'r1', title: 'Lemon orzo with dill', minutes: 22, tag: 'vegetarian' },
+  { id: 'r2', title: 'Charred cabbage steaks', minutes: 28, tag: 'one pot' },
+  { id: 'r3', title: 'Miso butter noodles', minutes: 15, tag: 'vegetarian' },
+  { id: 'r4', title: 'Tomato galette', minutes: 55, tag: 'baking' },
+];
+
+/** Stands in for a real API: the data arrives a moment after the first render. */
+export function fetchRecipes(): Promise<Recipe[]> {
+  console.log('[recipes] loading');
+  return new Promise((resolve) => setTimeout(() => resolve(RECIPES), 600));
+}`;
+
+const RECIPE_CARD = `import { Clock } from 'lucide-react';
+import type { Recipe } from '../lib/recipes';
+
+export function RecipeCard({ recipe }: { recipe: Recipe }) {
+  return (
+    <article className="overflow-hidden rounded-xl border border-stone-200 bg-white shadow-sm">
+      <div className="h-24 bg-gradient-to-br from-amber-100 to-orange-100" />
+      <div className="flex flex-col gap-1.5 p-4">
+        <h2 className="font-semibold text-stone-900">{recipe.title}</h2>
+        <p className="flex items-center gap-1.5 text-xs text-stone-500">
+          <Clock size={13} />
+          {recipe.minutes} min · {recipe.tag}
+        </p>
+      </div>
+    </article>
+  );
+}`;
+
+/**
+ * The recipes page. "broken" maps over data that has not loaded yet (the
+ * classic first-render crash); "stubborn" only asserts it away, so it still
+ * crashes; "guarded" waits for the data.
+ */
+function recipeHome(variant: 'broken' | 'stubborn' | 'guarded', unfixable: boolean): string {
+  const list =
+    variant === 'guarded'
+      ? `        {isLoading ? (
+          <p className="mt-6 text-sm text-stone-500">Loading recipes…</p>
+        ) : (
+          <div className="mt-6 grid gap-4 sm:grid-cols-2">
+            {(data ?? []).map((recipe) => (
+              <RecipeCard key={recipe.id} recipe={recipe} />
+            ))}
+          </div>
+        )}`
+      : `        <div className="mt-6 grid gap-4 sm:grid-cols-2">
+          {${variant === 'stubborn' ? 'data!' : 'data'}.map((recipe) => (
+            <RecipeCard key={recipe.id} recipe={recipe} />
+          ))}
+        </div>`;
+  return `import { useQuery } from '@tanstack/react-query';
+import { RecipeCard } from '../components/RecipeCard';
+import { fetchRecipes, type Recipe } from '../lib/recipes';
+${unfixable ? `${UNFIXABLE_MARK}\n` : ''}
+export default function Home() {
+  const { data, isLoading } = useQuery<Recipe[]>({ queryKey: ['recipes'], queryFn: fetchRecipes });
+  console.log('[recipes] render, loading:', isLoading);
+
+  return (
+    <main className="min-h-screen bg-amber-50/50 px-6 py-12">
+      <div className="mx-auto max-w-3xl">
+        <h1 className="text-2xl font-semibold tracking-tight text-stone-900">Recipe Box</h1>
+        <p className="mt-1 text-sm text-stone-500">Quick dinners, sorted by cook time.</p>
+${list}
+      </div>
+    </main>
+  );
+}`;
+}
+
+function recipeApp(unfixable: boolean): string {
+  return `I'll build a recipe list that loads your recipes and shows each one as a card.
+
+<changes>
+<write path="src/lib/recipes.ts">
+${RECIPES_LIB}
+</write>
+<write path="src/components/RecipeCard.tsx">
+${RECIPE_CARD}
+</write>
+<write path="src/pages/Home.tsx">
+${recipeHome('broken', unfixable)}
+</write>
+</changes>
+
+Your recipes now show as cards with their cook times.`;
+}
+
+function recipeRepair(context: string, prompt: string): string {
+  if (!/reading 'map'/.test(prompt)) return "I'm the offline mock model: I can only repair the demo recipe crash.";
+  const unfixable = context.includes(UNFIXABLE_MARK);
+  return `${unfixable ? 'Telling TypeScript the data is there before the list renders.' : 'Adding a loading state so the list waits for the data.'}
+
+<changes>
+<write path="src/pages/Home.tsx">
+${recipeHome(unfixable ? 'stubborn' : 'guarded', unfixable)}
+</write>
+</changes>
+
+${unfixable ? 'The list renders the data directly.' : 'The recipes page shows a loading message until the data arrives.'}`;
 }
 
 /** "build me a recipe tracker for my family" -> "Recipe Tracker" */
