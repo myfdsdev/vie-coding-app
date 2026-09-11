@@ -37,6 +37,23 @@ const MIGRATIONS: string[] = [
      project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
      note TEXT NOT NULL
    );`,
+  // M2: one row per model call; see meter.ts for what gets billed.
+  `CREATE TABLE ledger (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     project_id TEXT NOT NULL,
+     turn_id TEXT NOT NULL,
+     attempt INTEGER NOT NULL,
+     kind TEXT NOT NULL CHECK (kind IN ('build', 'retry', 'repair')),
+     model TEXT NOT NULL,
+     input_tokens INTEGER NOT NULL,
+     output_tokens INTEGER NOT NULL,
+     cache_read_tokens INTEGER NOT NULL,
+     cache_write_tokens INTEGER NOT NULL,
+     credits REAL NOT NULL,
+     billed INTEGER NOT NULL DEFAULT 0,
+     created_at INTEGER NOT NULL
+   );
+   CREATE INDEX ledger_turn ON ledger (turn_id);`,
 ];
 
 // Keyed by file so tests that point FORGE_DATA_DIR elsewhere get their own connection.
