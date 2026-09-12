@@ -122,6 +122,9 @@ function isPackage(spec: string): boolean {
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/** entities/<Name>.json, the only place a data model may live. */
+const ENTITY_FILE = /^entities\/([A-Z][A-Za-z0-9]{0,30})\.json$/;
+
 /**
  * A made-up package whose every import is a named import of real lucide
  * icons ("lucide-react-icons") is certainly meant to be lucide-react.
@@ -185,6 +188,54 @@ export async function validateProject(input: {
     return { results, changed: [], added: [], issues, secrets };
   }
   results.push({ gate: 'secrets', status: 'pass', detail: `${plural(input.written.length, 'written file')} checked` });
+
+  // data-model — entity files, then the client Forge generates from them
+  const entities: Entity[] = [];
+  const dataIssues: Issue[] = [];
+  const filledIn: string[] = [];
+  for (const p of [...paths].filter((f) => ENTITY_FILE.test(f)).sort()) {
+    try {
+      const { entity, filled } = parseEntity(content(p), p);
+      const expected = ENTITY_FILE.exec(p)![1];
+      if (entity.name !== expected) {
+        dataIssues.push({ message: `${p} declares the entity "${entity.name}"; rename the file to entities/${entity.name}.json or change the name.`, file: p });
+        continue;
+      }
+      entities.push(entity);
+      if (filled.length) filledIn.push(`${entity.name} (${filled.join(', ')})`);
+      // Canonical form: access rules always spelled out, always in the same shape.
+      const canonical = serialiseEntity(entity);
+      if (canonical !== content(p)) changed.set(p, canonical);
+    } catch (err) {
+      dataIssues.push({ message: err instanceof EntityError ? err.message : `${p} could not be read.`, file: p });
+    }
+  }
+  issues.push(...dataIssues);
+  const generated: string[] = [];
+  if (entities.length || [...paths].some((p) => p.startsWith(FORGE_DIR))) {
+    for (const file of [
+      { path: DATA_FILE, content: generateData(entities) },
+      { path: AUTH_FILE, content: generateAuth() },
+    ]) {
+      paths.add(file.path); // it exists by the time anything runs, so imports of it resolve
+      if (content(file.path) !== file.content) {
+        changed.set(file.path, file.content);
+        generated.push(file.path);
+      }
+    }
+  }
+  const names = entities.map((e) => e.name).join(', ');
+  const summary: string[] = [];
+  if (generated.length) summary.push(`generated ${generated.map((p) => p.replace(FORGE_DIR, '')).join(' and ')} for ${names}`);
+  else if (entities.length) summary.push(`${names} — access rules in place`);
+  if (filledIn.length) summary.push(`private by default: ${filledIn.join(', ')}`);
+  results.push({
+    gate: 'data-model',
+    status: dataIssues.length ? 'fail' : generated.length || filledIn.length ? 'fixed' : 'pass',
+    detail: dataIssues.length ? dataIssues.map((i) => i.message).join('; ') : entities.length ? summary.join('; ') : 'no stored data',
+  });
+
+  const code = [...paths].filter((p) => p.startsWith('src/') && CODE_FILE.test(p)).sort();
 
   // packages + package-json
   const pkg = JSON.parse(current.get('package.json') ?? '{}') as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
