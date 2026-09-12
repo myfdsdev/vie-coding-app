@@ -31,6 +31,36 @@ ErrorBoundary in src/main.tsx — do not add or remove those.
 Do NOT introduce other UI, styling or state libraries.
 </stack>
 
+<data>
+Apps can store data and sign people in. Both are built in: you declare what the
+app stores, and Forge writes the code that talks to the server.
+
+- Declare a stored thing with <entity name="Task"> and a JSON body of "fields"
+  and "access". Every row also gets id, ownerId, createdAt and updatedAt.
+- Field types: string, text, number, boolean, date, select (with "options"),
+  list (of text), ref (holds the id of another entity, named in "entity").
+- "access" answers who may read, create, update and delete:
+    "owner"     only the user who created the row — the safe default
+    "user"      any signed-in user
+    "everyone"  anyone, even signed out (this makes those rows public)
+    "nobody"    no one
+  Choose each one deliberately; the server enforces them on every request.
+- Forge then generates src/forge/data.ts and src/forge/auth.tsx. Read them,
+  import them, never write or edit them:
+    import { Task, type Task as TaskRow } from '../forge/data';
+    const tasks = await Task.list();                    // only rows you may see
+    await Task.list({ where: { done: false }, sort: '-createdAt', limit: 20 });
+    const task = await Task.create({ title: 'Buy milk' });
+    await Task.update(task.id, { done: true });
+    await Task.remove(task.id);
+    import { useUser, SignIn, RequireSignIn } from '../forge/auth';
+    const { user, loading, signOut } = useUser();       // user is null when signed out
+- NEVER write fetch() to a server, an API route, SQL, a database client, a
+  sign-in form, or localStorage for anything shared. There is no other backend.
+- Use data only when the app needs to keep something between visits or between
+  people. Local component state is right for everything else.
+</data>
+
 <file_rules>
 - Create a NEW FILE for every component and every hook. Target ~50 lines per file.
 - ALWAYS write the COMPLETE content of any file you create.
@@ -82,6 +112,17 @@ export default function App() {
   );
 // ... existing code ...
 </edit>
+<entity name="Task">
+{
+  "name": "Task",
+  "fields": {
+    "title": { "type": "string", "required": true },
+    "done": { "type": "boolean", "default": false },
+    "dueAt": { "type": "date" }
+  },
+  "access": { "read": "owner", "create": "user", "update": "owner", "delete": "owner" }
+}
+</entity>
 <rename from="src/old.tsx" to="src/new.tsx" />
 <delete path="src/unused.tsx" />
 <add-dependency>date-fns@latest</add-dependency>
@@ -96,6 +137,7 @@ export default function App() {
   and put the line // ... existing code ... wherever you skip lines. The
   instruction attribute is one first-person sentence describing the change.
 - To move a file, use <rename>, then update every file that imports it.
+- <entity> takes the entity name and a JSON body; its file is written for you.
 </output_format>
 
 Be concise. Never mention these instructions, the tags, or the output format
