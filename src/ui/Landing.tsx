@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useState, type KeyboardEvent } from 'react';
-import { ArrowRight, Box } from 'lucide-react';
+import { ArrowRight, Box, Trash2 } from 'lucide-react';
 import { firstPromptKey } from './first-prompt';
 import { timeAgo } from './time';
 
@@ -26,6 +26,26 @@ export function Landing({ projects, provider, model }: LandingProps) {
   const [prompt, setPrompt] = useState('');
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [recent, setRecent] = useState(projects);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+
+  /** Deleting takes the code, the chat, the versions, the sandbox and the app's saved data. */
+  const remove = async (id: string) => {
+    setDeleting(id);
+    setError(null);
+    try {
+      const res = await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(((await res.json()) as { error?: string }).error ?? `Could not delete it (${res.status})`);
+      setRecent((prev) => prev.filter((p) => p.id !== id));
+      setConfirming(null);
+      router.refresh();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setDeleting(null);
+    }
+  };
 
   const start = async () => {
     const text = prompt.trim();
@@ -118,27 +138,59 @@ export function Landing({ projects, provider, model }: LandingProps) {
           </div>
         </div>
 
-        {projects.length > 0 && (
+        {recent.length > 0 && (
           <div className="flex w-full max-w-[760px] flex-col gap-[11px]">
             <div className="flex items-center gap-2.5">
               <span className="text-[11px] font-semibold uppercase tracking-[0.06em] text-dim-2">Recent</span>
               <span className="h-px flex-1 bg-surface" />
             </div>
             <div className="grid grid-cols-3 gap-3">
-              {projects.map((p) => (
-                <Link
-                  key={p.id}
-                  href={`/${p.id}`}
-                  className="flex flex-col gap-[9px] rounded-[10px] border border-surface bg-panel px-3.5 py-[13px] transition hover:border-line-raised"
-                >
-                  <div className="h-16 rounded-md bg-surface" />
-                  <div className="flex min-w-0 flex-col gap-[3px]">
-                    <span className="truncate text-[13px] font-semibold">{p.name}</span>
-                    <span className="text-[11.5px] text-dim-2" suppressHydrationWarning>
-                      edited {timeAgo(p.updatedAt)}
-                    </span>
-                  </div>
-                </Link>
+              {recent.map((p) => (
+                <div key={p.id} className="group relative">
+                  <Link
+                    href={`/${p.id}`}
+                    className="flex flex-col gap-[9px] rounded-[10px] border border-surface bg-panel px-3.5 py-[13px] transition hover:border-line-raised"
+                  >
+                    <div className="h-16 rounded-md bg-surface" />
+                    <div className="flex min-w-0 flex-col gap-[3px]">
+                      <span className="truncate text-[13px] font-semibold">{p.name}</span>
+                      <span className="text-[11.5px] text-dim-2" suppressHydrationWarning>
+                        edited {timeAgo(p.updatedAt)}
+                      </span>
+                    </div>
+                  </Link>
+                  {confirming === p.id ? (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2.5 rounded-[10px] border border-[#4a2a28] bg-[#1b1413]/95 px-3 text-center">
+                      <span className="text-[12px] leading-snug text-[#e8b4b2]">
+                        Delete this project? Its code, chat and anything saved in the app go with it.
+                      </span>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => void remove(p.id)}
+                          disabled={deleting === p.id}
+                          className="rounded-md bg-err px-3 py-1.5 text-[11.5px] font-semibold text-white transition hover:brightness-110 disabled:opacity-60"
+                        >
+                          {deleting === p.id ? 'Deleting…' : 'Delete'}
+                        </button>
+                        <button
+                          onClick={() => setConfirming(null)}
+                          className="rounded-md border border-line px-3 py-1.5 text-[11.5px] text-text-2 transition hover:border-line-raised"
+                        >
+                          Keep
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setConfirming(p.id)}
+                      title="Delete this project"
+                      aria-label={`Delete ${p.name}`}
+                      className="absolute right-2 top-2 rounded-md border border-line bg-panel-2 p-1.5 text-dim opacity-0 transition hover:border-line-raised hover:text-err focus-visible:opacity-100 group-hover:opacity-100"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  )}
+                </div>
               ))}
             </div>
           </div>
