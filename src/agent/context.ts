@@ -16,7 +16,7 @@ const OMIT_CONTENT = new Set([
 
 const MAX_FILE_CHARS = 40_000;
 
-export function buildContext(files: { path: string; content: string }[]): string {
+export function buildContext(files: { path: string; content: string }[], secretNames: string[] = []): string {
   const sorted = [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const tree = sorted.map((f) => f.path).join('\n');
   const blocks = sorted
@@ -28,7 +28,13 @@ export function buildContext(files: { path: string; content: string }[]): string
           : f.content;
       return `--- ${f.path} ---\n${body}`;
     });
+  // Names only, never values (§3.7): the model must know a key exists without
+  // ever seeing it. Server-side code reads the value; app code never can.
+  const secrets = secretNames.length
+    ? ['<secrets>', 'Stored for this app, values hidden and unavailable to app code:', [...secretNames].sort().join('\n'), '</secrets>', '']
+    : [];
   return [
+    ...secrets,
     '<project_files>',
     'All files currently in the project (content of infrastructure files omitted):',
     tree,

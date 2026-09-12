@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { appDb } from './db';
+import { appDb, appDbFile } from './db';
 import { DATA_DIR } from '../store/db';
 
 /**
@@ -71,6 +71,8 @@ export interface SecretInfo {
 
 /** Names only — there is no API anywhere that returns a value. */
 export function listSecrets(projectId: string): SecretInfo[] {
+  // Asking must not create an app database for a project that stores nothing.
+  if (!fs.existsSync(appDbFile(projectId))) return [];
   return appDb(projectId).prepare('SELECT name, updated_at AS updatedAt FROM secrets ORDER BY name').all() as SecretInfo[];
 }
 

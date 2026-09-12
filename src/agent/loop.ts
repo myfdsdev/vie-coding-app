@@ -549,7 +549,8 @@ async function modelPass(opts: {
     }
   };
 
-  for await (const ev of provider.stream({ system: SYSTEM_PROMPT, context: buildContext(files), messages: conversation, signal })) {
+  const secrets = listSecrets(projectId).map((s) => s.name);
+  for await (const ev of provider.stream({ system: SYSTEM_PROMPT, context: buildContext(files, secrets), messages: conversation, signal })) {
     if (ev.type === 'text') {
       response += ev.text;
       onParse(parser.push(ev.text));
