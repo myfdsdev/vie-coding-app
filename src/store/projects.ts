@@ -247,6 +247,21 @@ export function listProjects(limit = 24): Project[] {
 }
 
 /** Record activity. A project still named after its id (or "untitled") takes `name`. */
+/**
+ * Remove a project for good: its code, its chat, its versions and its
+ * ledger rows. The caller deals with the sandbox and the app database.
+ * There is no undo, which is why the button asks twice.
+ */
+export async function deleteProject(id: string): Promise<void> {
+  assertProjectId(id);
+  await fs.rm(workspaceDir(id), { recursive: true, force: true, maxRetries: 3 });
+  const conn = db();
+  conn.transaction(() => {
+    conn.prepare('DELETE FROM ledger WHERE project_id = ?').run(id);
+    conn.prepare('DELETE FROM projects WHERE id = ?').run(id); // messages, history and notes cascade
+  })();
+}
+
 export function touchProject(id: string, name?: string): void {
   db()
     .prepare(

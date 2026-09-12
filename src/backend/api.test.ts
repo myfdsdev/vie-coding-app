@@ -63,7 +63,7 @@ async function api(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', target: string, 
   const text = await res.text();
   return {
     status: res.status,
-    body: (text ? JSON.parse(text) : {}) as Record<string, never>,
+    body: (text ? JSON.parse(text) : {}) as Record<string, unknown>,
     cookie: (res.headers.get('set-cookie') ?? '').split(';')[0],
     setCookie: res.headers.get('set-cookie') ?? '',
   };

@@ -63,6 +63,20 @@ export async function waitForReady(sandbox: Sandbox, timeoutMs = 60_000): Promis
 }
 
 /**
+ * Take a project's sandbox away with the project: the container and the
+ * volume holding its copy of the code. Never throws — a project the user
+ * deleted must disappear whether or not Docker is reachable.
+ */
+export async function destroySandbox(projectId: string): Promise<void> {
+  try {
+    const existing = await getSandboxProvider().resume(projectId);
+    await existing?.destroy();
+  } catch (err) {
+    console.error(`[forge] could not remove the sandbox for ${projectId}`, err);
+  }
+}
+
+/**
  * Bring a sandbox up to date after the workspace changed outside a turn (a
  * version restore): exactly the given files, then dependencies if needed.
  */

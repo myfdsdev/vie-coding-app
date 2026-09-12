@@ -23,7 +23,6 @@ import {
   writeProjectFile,
 } from '../store/projects';
 import { AUTH_FILE, DATA_FILE } from '../backend/codegen';
-import { parseEntity, serialiseEntity } from '../backend/entities';
 import { listSecrets } from '../backend/secrets';
 import { applyEdit } from './apply-edit';
 import { LoopBudget } from './budget';
@@ -730,19 +729,13 @@ async function applyOps(
         fail(op.to, 'renamed', (err as Error).message);
       }
     } else if (op.type === 'entity') {
-      // The data model (M4): a declaration, never a table or a query. Stored
-      // in the canonical form when it parses, so the access rules are always
-      // spelled out; an invalid one is written as sent and VALIDATE returns it
-      // to the model with the reason.
+      // The data model (M4): a declaration, never a table or a query. It is
+      // stored as sent; VALIDATE is what checks it, fills in the access rules
+      // it leaves out, and rewrites it in the canonical form.
       const path = entityFilePath(op.name);
       const change: FileChange = known.has(path) ? 'modified' : 'created';
       try {
-        let content = op.json.endsWith('\n') ? op.json : `${op.json}\n`;
-        try {
-          content = serialiseEntity(parseEntity(op.json, path).entity);
-        } catch {
-          /* the data-model gate explains it */
-        }
+        const content = op.json.endsWith('\n') ? op.json : `${op.json}\n`;
         await writeProjectFile(projectId, path, content);
         record(path, content, change);
       } catch (err) {

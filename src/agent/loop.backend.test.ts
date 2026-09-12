@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { isProtectedPath } from '../store/projects';
+import type { isProtectedPath as isProtectedPathFn } from '../store/projects';
 import type { getSandboxProvider as getSandboxProviderFn } from '../sandbox';
 import type { MockSandboxProvider as MockSandboxProviderClass } from '../sandbox/mock';
 import type { runTurn as runTurnFn } from './loop';
@@ -20,6 +20,7 @@ const saved: Record<string, string | undefined> = {};
 let tmp = '';
 let runTurn: typeof runTurnFn;
 let getSandboxProvider: typeof getSandboxProviderFn;
+let isProtectedPath: typeof isProtectedPathFn;
 
 beforeAll(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-backend-'));
@@ -27,8 +28,12 @@ beforeAll(async () => {
     saved[key] = process.env[key];
     process.env[key] = value;
   }
+  // Everything is imported here, never at the top: these modules read the
+  // paths above when they load, and a static import would run first — writing
+  // this test's projects into the real workspaces folder.
   runTurn = (await import('./loop')).runTurn;
   getSandboxProvider = (await import('../sandbox')).getSandboxProvider;
+  isProtectedPath = (await import('../store/projects')).isProtectedPath;
 });
 
 afterAll(async () => {

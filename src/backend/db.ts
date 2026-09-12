@@ -81,6 +81,15 @@ export function closeAppDbs(): void {
   connections.clear();
 }
 
+/** Delete an app's data with its project: rows, users, sessions and secrets. */
+export function deleteAppDb(projectId: string): void {
+  const file = appDbFile(projectId);
+  connections.get(file)?.close();
+  connections.delete(file);
+  // WAL keeps two companions beside the database file.
+  for (const suffix of ['', '-wal', '-shm']) fs.rmSync(file + suffix, { force: true });
+}
+
 function migrate(conn: Database.Database): void {
   conn
     .transaction(() => {
