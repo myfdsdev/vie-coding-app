@@ -21,6 +21,11 @@ import type { ModelRequest } from './providers';
  *   the model can fix: one more pass creates it.
  * - A request to hard-code a key: code containing one, which the secrets gate
  *   stops.
+ * - A request mentioning sign-in, accounts, saving or a database: a task list
+ *   with a real backend — an <entity> with no access rules (Forge fills in
+ *   private-by-default) and pages built on the generated client. With
+ *   "shared" or "everyone" the tasks are readable by any signed-in user
+ *   instead, which is what a deliberate choice looks like.
  */
 export function mockResponse(req: ModelRequest): string {
   const last = req.messages[req.messages.length - 1]?.content ?? '';
@@ -28,6 +33,7 @@ export function mockResponse(req: ModelRequest): string {
   if (SECRET_REQUEST.test(last)) return paymentsWithKey();
   if (BREAKING_REQUEST.test(last)) return recipeApp(/unfixable/i.test(last));
   if (DASHBOARD_REQUEST.test(last)) return dashboardApp(/sidebar/i.test(last));
+  if (BACKEND_REQUEST.test(last)) return savedTasksApp(SHARED_REQUEST.test(last));
   if (req.context.includes('src/hooks/useTasks.ts')) {
     const color: Badge = req.context.includes(`rounded-xl ${BADGE.rose}`) ? 'indigo' : 'rose';
     return /could not be placed exactly/.test(last) ? headerRewrite(color) : headerEdit(color);
@@ -37,6 +43,8 @@ export function mockResponse(req: ModelRequest): string {
 
 const BREAKING_REQUEST = /data\.map|before the (?:fetch|data)|unfixable/i;
 const DASHBOARD_REQUEST = /dashboard|invoice/i;
+const BACKEND_REQUEST = /\b(sign ?-?in|sign ?-?up|log ?-?in|account|accounts|users|their own|my own|private|saved?|stores?|storage|database|back ?end)\b/i;
+const SHARED_REQUEST = /\b(shared|share|everyone|together|team board|whole team)\b/i;
 const SECRET_REQUEST = /hard-?cod(?:e|ed|ing)\b[^.]*\bkey\b/i;
 const UNFIXABLE_MARK = '// forge-mock: unfixable';
 
