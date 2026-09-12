@@ -12,6 +12,15 @@ import { createPreviewProxy, previewProjectId } from './src/preview/proxy';
  * The preview must be a different origin from the builder, or the iframe
  * sandbox attribute is meaningless (SETUP-GUIDE §7).
  */
+/** The prefix a generated app calls its own backend on (src/forge/data.ts). */
+const BACKEND_PREFIX = '/_forge/';
+
+/** The builder route a preview-origin backend call maps to, or null for the app itself. */
+function backendPath(url: string | undefined, projectId: string): string | null {
+  if (!url || !url.startsWith(BACKEND_PREFIX)) return null;
+  return `/api/app/${projectId}/${url.slice(BACKEND_PREFIX.length)}`;
+}
+
 async function main() {
   loadEnvConfig(process.cwd());
   const dev = process.env.NODE_ENV !== 'production';
@@ -25,7 +34,21 @@ async function main() {
   const isPreview = (req: http.IncomingMessage) => previewProjectId(req.headers.host) !== null;
 
   const server = http.createServer((req, res) => {
-    if (isPreview(req)) return preview.web(req, res);
+    // Only this line may set it; a client that sends it must not be believed.
+    delete req.headers['x-forge-preview'];
+    const projectId = previewProjectId(req.headers.host);
+    if (projectId) {
+      // The generated app's own backend (M4). It answers on the preview origin,
+      // so the app can call it with its session cookie, but it runs here —
+      // the sandbox never sees the data, the sessions or the secrets.
+      const backend = backendPath(req.url, projectId);
+      if (backend) {
+        req.url = backend;
+        req.headers['x-forge-preview'] = '1';
+      } else {
+        return preview.web(req, res);
+      }
+    }
     handle(req, res).catch((err) => {
       console.error('[forge] request failed', err);
       if (!res.headersSent) res.writeHead(500);
