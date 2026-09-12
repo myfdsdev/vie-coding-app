@@ -128,6 +128,7 @@ describe('validateProject', () => {
     const v = await validateProject({ files: project({ 'src/App.tsx': "import './index.css';\n", 'src/index.css': '' }), written: [], registry: registry({}) });
     expect(v.results.map((r) => [r.gate, r.status])).toEqual([
       ['secrets', 'pass'],
+      ['data-model', 'pass'],
       ['packages', 'pass'],
       ['package-json', 'pass'],
       ['imports', 'pass'],

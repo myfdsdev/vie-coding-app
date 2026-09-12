@@ -134,6 +134,26 @@ export default function Home() { return null; }
   });
 });
 
+describe('entity declarations', () => {
+  const block = (body: string) => `Saving them.\n\n<changes>\n<entity name="Task">\n${body}\n</entity>\n</changes>\n\nDone.`;
+
+  it('emits the data model as an op and shows its file while it streams', () => {
+    const events = parseInChunks(block('{ "name": "Task", "fields": { "title": "string" } }'), 7);
+    expect(events.filter((e) => e.type === 'file-start')).toEqual([{ type: 'file-start', kind: 'entity', path: 'entities/Task.json' }]);
+    const ops = events.flatMap((e) => (e.type === 'op' ? [e.op] : [])) as ChangeOp[];
+    expect(ops).toEqual([{ type: 'entity', name: 'Task', json: '{ "name": "Task", "fields": { "title": "string" } }' }]);
+    expect(events.some((e) => e.type === 'warning')).toBe(false);
+  });
+
+  it('ignores one with no name or no body, and says so', () => {
+    const nameless = parseInChunks('<changes>\n<entity>\n{}\n</entity>\n</changes>', 5);
+    expect(nameless.filter((e) => e.type === 'warning')).toHaveLength(1);
+    expect(nameless.some((e) => e.type === 'op')).toBe(false);
+    const empty = parseInChunks(block('   '), 5);
+    expect(empty.filter((e) => e.type === 'warning')).toHaveLength(1);
+  });
+});
+
 describe('helpers', () => {
   it('partialSuffix finds the longest held-back prefix', () => {
     expect(partialSuffix('abc <chan', '<changes>')).toBe(5);
