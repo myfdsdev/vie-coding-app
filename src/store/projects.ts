@@ -31,6 +31,14 @@ export const PROTECTED_PATHS = new Set([
   'package-lock.json',
 ]);
 
+/** Folders Forge generates and keeps in step with the data model (M4). */
+const PROTECTED_DIRS = ['src/forge/'];
+
+/** Whether the model may write this path. It may read all of them. */
+export function isProtectedPath(rel: string): boolean {
+  return PROTECTED_PATHS.has(rel) || PROTECTED_DIRS.some((dir) => rel.startsWith(dir));
+}
+
 export function newProjectId(): string {
   // 10 base-36 characters; the first is a letter so ids never look numeric.
   const letters = 'abcdefghijklmnopqrstuvwxyz';

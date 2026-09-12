@@ -15,16 +15,18 @@ export type ChangeOp =
   | { type: 'edit'; path: string; instruction: string; body: string }
   | { type: 'rename'; from: string; to: string }
   | { type: 'delete'; path: string }
-  | { type: 'add-dependency'; spec: string };
+  | { type: 'add-dependency'; spec: string }
+  /** A data model declaration; its JSON body becomes entities/<name>.json. */
+  | { type: 'entity'; name: string; json: string };
 
 export type ParseEvent =
   | { type: 'text'; text: string; phase: 'before' | 'after' }
-  | { type: 'file-start'; kind: 'write' | 'edit'; path: string }
+  | { type: 'file-start'; kind: 'write' | 'edit' | 'entity'; path: string }
   | { type: 'file-chunk'; path: string; text: string }
   | { type: 'op'; op: ChangeOp }
   | { type: 'warning'; message: string };
 
-type BodyKind = 'write' | 'edit' | 'add-dependency';
+type BodyKind = 'write' | 'edit' | 'add-dependency' | 'entity';
 
 type State =
   | { name: 'prose' }
@@ -36,7 +38,13 @@ const CLOSE_TAG: Record<BodyKind, string> = {
   write: '</write>',
   edit: '</edit>',
   'add-dependency': '</add-dependency>',
+  entity: '</entity>',
 };
+
+/** <entity name="Task"> writes this file; the mapping lives in one place. */
+export function entityFilePath(name: string): string {
+  return `entities/${name}.json`;
+}
 
 /** Length of the longest suffix of `buf` that is a proper prefix of `token`. */
 export function partialSuffix(buf: string, token: string): number {
@@ -159,6 +167,13 @@ export class ChangesParser {
   }
 
   private finishBody(s: Extract<State, { name: 'body' }>, out: ParseEvent[]) {
+    if (s.kind === 'entity') {
+      const name = s.instruction; // the name attribute, kept in the same slot
+      if (!name) out.push({ type: 'warning', message: '<entity> without a name attribute ignored.' });
+      else if (!s.content.trim()) out.push({ type: 'warning', message: `<entity name="${name}"> was empty and ignored.` });
+      else out.push({ type: 'op', op: { type: 'entity', name, json: s.content.trim() } });
+      return;
+    }
     if (s.kind === 'add-dependency') {
       const spec = s.content.trim();
       if (spec) out.push({ type: 'op', op: { type: 'add-dependency', spec } });
@@ -198,6 +213,13 @@ export class ChangesParser {
       case 'add-dependency':
         this.state = { name: 'body', kind: 'add-dependency', path: '', instruction: '', content: '' };
         return;
+      case 'entity': {
+        const entityName = (attrs.name ?? '').trim();
+        const path = entityName ? entityFilePath(entityName) : '';
+        this.state = { name: 'body', kind: 'entity', path, instruction: entityName, content: '' };
+        if (path) out.push({ type: 'file-start', kind: 'entity', path });
+        return;
+      }
       case 'rename':
         if (attrs.from && attrs.to) out.push({ type: 'op', op: { type: 'rename', from: attrs.from.trim(), to: attrs.to.trim() } });
         else out.push({ type: 'warning', message: `<rename> needs from and to: ${tag}` });

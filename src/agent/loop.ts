@@ -9,7 +9,7 @@ import { appendHistory, getHistory, takePendingNote } from '../store/chats';
 import { checkpoint, discardChanges, ensureRepo, listVersions } from '../store/checkpoints';
 import { recordUsage, settleTurn, type LedgerKind } from '../store/meter';
 import {
-  PROTECTED_PATHS,
+  isProtectedPath,
   TEMPLATE_DIR,
   deleteProjectFile,
   ensureProject,
@@ -654,7 +654,7 @@ async function applyOps(
       const change: FileChange = known.has(normalise(op.path)) ? 'modified' : 'created';
       try {
         const path = safeRelativePath(op.path);
-        if (PROTECTED_PATHS.has(path)) {
+        if (isProtectedPath(path)) {
           fail(path, change, 'This file is managed by the builder and cannot be changed.');
           continue;
         }
@@ -667,7 +667,7 @@ async function applyOps(
     } else if (op.type === 'edit') {
       try {
         const path = safeRelativePath(op.path);
-        if (PROTECTED_PATHS.has(path)) {
+        if (isProtectedPath(path)) {
           fail(path, 'modified', 'This file is managed by the builder and cannot be changed.');
           continue;
         }
@@ -687,7 +687,7 @@ async function applyOps(
     } else if (op.type === 'delete') {
       try {
         const path = safeRelativePath(op.path);
-        if (PROTECTED_PATHS.has(path)) {
+        if (isProtectedPath(path)) {
           fail(path, 'deleted', 'This file is managed by the builder and cannot be deleted.');
           continue;
         }
@@ -704,7 +704,7 @@ async function applyOps(
       try {
         const from = safeRelativePath(op.from);
         const to = safeRelativePath(op.to);
-        if (PROTECTED_PATHS.has(from) || PROTECTED_PATHS.has(to)) {
+        if (isProtectedPath(from) || isProtectedPath(to)) {
           fail(to, 'renamed', 'Builder-managed files cannot be renamed.');
           continue;
         }
