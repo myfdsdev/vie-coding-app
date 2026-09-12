@@ -7,9 +7,10 @@ import type { SandboxStatus } from '@/sandbox/types';
 import { ChatPane } from './ChatPane';
 import { FileTree } from './FileTree';
 import { firstPromptKey } from './first-prompt';
+import { DataPanel } from './DataPanel';
 import { HistoryPanel } from './HistoryPanel';
 import { PreviewPane } from './PreviewPane';
-import { TopBar } from './TopBar';
+import { TopBar, type Panel } from './TopBar';
 import { applyTurnEvent, newAssistantTurn, readTurnEvents, type AssistantTurn, type ChatMessage } from './turn-state';
 
 export interface SandboxState {
@@ -41,7 +42,7 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
   const [sandbox, setSandbox] = useState<SandboxState>({ status: 'unknown', detail: 'Connecting to the sandbox' });
   const [previewKey, setPreviewKey] = useState(0);
   const [busy, setBusy] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [panel, setPanel] = useState<Panel>('chat');
   const [versionsKey, setVersionsKey] = useState(0);
   const [credits, setCredits] = useState(initialCredits);
   const [idleErrors, setIdleErrors] = useState<PreviewError[]>([]);
@@ -275,12 +276,14 @@ export function Builder({ project, provider, model, previewUrl, initialMessages,
         provider={provider}
         model={model}
         credits={credits}
-        historyOpen={historyOpen}
-        onToggleHistory={() => setHistoryOpen((open) => !open)}
+        panel={panel}
+        onPanel={setPanel}
       />
       <div className="flex min-h-0 flex-1">
-        {historyOpen ? (
-          <HistoryPanel projectId={projectId} refreshKey={versionsKey} busy={busy} onRestore={restore} onClose={() => setHistoryOpen(false)} />
+        {panel === 'history' ? (
+          <HistoryPanel projectId={projectId} refreshKey={versionsKey} busy={busy} onRestore={restore} onClose={() => setPanel('chat')} />
+        ) : panel === 'data' ? (
+          <DataPanel projectId={projectId} onClose={() => setPanel('chat')} />
         ) : (
           <ChatPane messages={messages} busy={busy} onSend={send} onStop={stop} onRollback={rollback} />
         )}
