@@ -376,6 +376,184 @@ ${INVOICES_LIB}
 Your invoice dashboard is ready — totals at the top, every invoice below.`;
 }
 
+// ---------------------------------------------------------------------------
+// Saved tasks with sign-in (M4): the model declares what to store and who may
+// see it; Forge generates src/forge/*, so none of that is written here.
+// ---------------------------------------------------------------------------
+
+const TASK_COMPOSER = `import { useState, type FormEvent } from 'react';
+import { Plus } from 'lucide-react';
+
+export function TaskComposer({ onAdd, busy }: { onAdd: (title: string) => void; busy: boolean }) {
+  const [title, setTitle] = useState('');
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    const value = title.trim();
+    if (!value) return;
+    console.log('[tasks] add', value);
+    onAdd(value);
+    setTitle('');
+  };
+
+  return (
+    <form onSubmit={submit} className="flex gap-2">
+      <input
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        placeholder="What needs doing?"
+        className="flex-1 rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-indigo-400"
+      />
+      <button
+        type="submit"
+        disabled={busy}
+        className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-indigo-500 disabled:opacity-60"
+      >
+        <Plus size={16} />
+        Add
+      </button>
+    </form>
+  );
+}`;
+
+const TASK_ROW = `import { Check, Trash2 } from 'lucide-react';
+import type { Task } from '../forge/data';
+
+interface TaskRowProps {
+  task: Task;
+  onToggle: () => void;
+  onRemove: () => void;
+}
+
+export function TaskRow({ task, onToggle, onRemove }: TaskRowProps) {
+  return (
+    <li className="group flex items-center gap-3 rounded-lg border border-slate-200 bg-white px-3.5 py-3 shadow-sm">
+      <button
+        onClick={onToggle}
+        aria-label={task.done ? 'Mark as not done' : 'Mark as done'}
+        className={
+          'flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition ' +
+          (task.done ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-slate-300 hover:border-indigo-400')
+        }
+      >
+        {task.done && <Check size={13} strokeWidth={3} />}
+      </button>
+      <span className={'flex-1 text-sm ' + (task.done ? 'text-slate-400 line-through' : 'text-slate-800')}>{task.title}</span>
+      <button
+        onClick={onRemove}
+        aria-label="Delete task"
+        className="rounded-md p-1 text-slate-300 opacity-0 transition hover:text-rose-500 group-hover:opacity-100"
+      >
+        <Trash2 size={15} />
+      </button>
+    </li>
+  );
+}`;
+
+function savedTasksHome(shared: boolean): string {
+  return `import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { LogOut } from 'lucide-react';
+import { TaskComposer } from '../components/TaskComposer';
+import { TaskRow } from '../components/TaskRow';
+import { RequireSignIn, useUser } from '../forge/auth';
+import { Task } from '../forge/data';
+
+export default function Home() {
+  return (
+    <RequireSignIn title="Your tasks" description="Sign in with your email and your list follows you anywhere.">
+      <TaskList />
+    </RequireSignIn>
+  );
+}
+
+function TaskList() {
+  const { user, signOut } = useUser();
+  const client = useQueryClient();
+  const tasks = useQuery({ queryKey: ['tasks'], queryFn: () => Task.list({ sort: '-createdAt' }) });
+  const refresh = () => client.invalidateQueries({ queryKey: ['tasks'] });
+  const add = useMutation({ mutationFn: (title: string) => Task.create({ title }), onSuccess: refresh });
+  const toggle = useMutation({ mutationFn: (task: Task) => Task.update(task.id, { done: !task.done }), onSuccess: refresh });
+  const remove = useMutation({ mutationFn: (id: string) => Task.remove(id), onSuccess: refresh });
+  const rows = tasks.data ?? [];
+  console.log('[tasks] showing', rows.length, 'tasks for', user?.email);
+
+  return (
+    <main className="min-h-screen bg-gradient-to-b from-slate-50 to-indigo-50/40 px-6 py-12">
+      <div className="mx-auto flex max-w-xl flex-col gap-6">
+        <header className="flex items-start gap-4">
+          <div className="min-w-0 flex-1">
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">${shared ? 'Team tasks' : 'Your tasks'}</h1>
+            <p className="mt-1 text-sm text-slate-500">
+              ${shared ? 'Everyone signed in sees the same list.' : 'Saved to your account — only you can see them.'}
+            </p>
+          </div>
+          <button
+            onClick={() => void signOut()}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-600 transition hover:border-slate-300"
+          >
+            <LogOut size={13} />
+            {user?.email}
+          </button>
+        </header>
+        <TaskComposer onAdd={(title) => add.mutate(title)} busy={add.isPending} />
+        {tasks.isLoading ? (
+          <p className="text-sm text-slate-500">Loading your tasks…</p>
+        ) : rows.length === 0 ? (
+          <p className="rounded-lg border border-dashed border-slate-200 py-10 text-center text-sm text-slate-400">Nothing here yet.</p>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {rows.map((task) => (
+              <TaskRow key={task.id} task={task} onToggle={() => toggle.mutate(task)} onRemove={() => remove.mutate(task.id)} />
+            ))}
+          </ul>
+        )}
+      </div>
+    </main>
+  );
+}`;
+}
+
+/**
+ * The default leaves "access" out entirely, so the data-model gate fills in
+ * private-by-default and says so; "shared" asks for the deliberate opposite.
+ */
+function savedTasksApp(shared: boolean): string {
+  const entity = shared
+    ? `{
+  "name": "Task",
+  "fields": {
+    "title": { "type": "string", "required": true },
+    "done": { "type": "boolean", "default": false }
+  },
+  "access": { "read": "user", "create": "user", "update": "owner", "delete": "owner" }
+}`
+    : `{
+  "name": "Task",
+  "fields": {
+    "title": { "type": "string", "required": true },
+    "done": { "type": "boolean", "default": false }
+  }
+}`;
+  return `I'll save the tasks to an account, so they are still there on the next visit${shared ? ' and everyone signed in sees the same list' : ' and only the person who wrote them can see them'}.
+
+<changes>
+<entity name="Task">
+${entity}
+</entity>
+<write path="src/components/TaskComposer.tsx">
+${TASK_COMPOSER}
+</write>
+<write path="src/components/TaskRow.tsx">
+${TASK_ROW}
+</write>
+<write path="src/pages/Home.tsx">
+${savedTasksHome(shared)}
+</write>
+</changes>
+
+Sign in with your email and your tasks are saved${shared ? ' for the whole team' : ' to your account'}.`;
+}
+
 /** The repair for "Failed to resolve import": write the file that was imported but never created. */
 function createMissing(spec: string, from: string): string {
   const target = path.posix.normalize(path.posix.join(path.posix.dirname(from), spec)) + '.tsx';
