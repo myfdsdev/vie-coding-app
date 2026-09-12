@@ -22,11 +22,14 @@ import {
   touchProject,
   writeProjectFile,
 } from '../store/projects';
+import { AUTH_FILE, DATA_FILE } from '../backend/codegen';
+import { parseEntity, serialiseEntity } from '../backend/entities';
+import { listSecrets } from '../backend/secrets';
 import { applyEdit } from './apply-edit';
 import { LoopBudget } from './budget';
 import { buildContext, historyEntryFor } from './context';
 import { buildFixPrompt, diagnoseError, referencedFiles } from './diagnose';
-import { ChangesParser, type ChangeOp, type ParseEvent } from './parser';
+import { ChangesParser, entityFilePath, type ChangeOp, type ParseEvent } from './parser';
 import { SYSTEM_PROMPT } from './prompt';
 import { getProvider, type ModelMessage, type ModelProvider, type ModelUsage } from './providers';
 import { fixSource, type SourceFix } from './stream-fixer';
@@ -613,6 +616,7 @@ function plannedPaths(known: Set<string>, ops: ChangeOp[]): Set<string> {
   for (const op of ops) {
     try {
       if (op.type === 'write' || op.type === 'edit') paths.add(safeRelativePath(op.path));
+      else if (op.type === 'entity') paths.add(entityFilePath(op.name));
       else if (op.type === 'delete') paths.delete(safeRelativePath(op.path));
       else if (op.type === 'rename') {
         paths.delete(safeRelativePath(op.from));
@@ -621,6 +625,11 @@ function plannedPaths(known: Set<string>, ops: ChangeOp[]): Set<string> {
     } catch {
       /* an invalid path fails when its operation is applied */
     }
+  }
+  // Forge writes the data client in VALIDATE; code importing it is already correct.
+  if ([...paths].some((p) => p.startsWith('entities/'))) {
+    paths.add(DATA_FILE);
+    paths.add(AUTH_FILE);
   }
   return paths;
 }
@@ -718,6 +727,25 @@ async function applyOps(
         emit({ type: 'file', path: to, from, status: 'done', change: 'renamed' });
       } catch (err) {
         fail(op.to, 'renamed', (err as Error).message);
+      }
+    } else if (op.type === 'entity') {
+      // The data model (M4): a declaration, never a table or a query. Stored
+      // in the canonical form when it parses, so the access rules are always
+      // spelled out; an invalid one is written as sent and VALIDATE returns it
+      // to the model with the reason.
+      const path = entityFilePath(op.name);
+      const change: FileChange = known.has(path) ? 'modified' : 'created';
+      try {
+        let content = op.json.endsWith('\n') ? op.json : `${op.json}\n`;
+        try {
+          content = serialiseEntity(parseEntity(op.json, path).entity);
+        } catch {
+          /* the data-model gate explains it */
+        }
+        await writeProjectFile(projectId, path, content);
+        record(path, content, change);
+      } catch (err) {
+        fail(path, change, (err as Error).message);
       }
     } else if (op.type === 'add-dependency') {
       const result = await addDependency(projectId, op.spec, registry);
