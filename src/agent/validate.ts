@@ -1,3 +1,5 @@
+import { AUTH_FILE, DATA_FILE, FORGE_DIR, generateAuth, generateData } from '../backend/codegen';
+import { EntityError, parseEntity, serialiseEntity, type Entity } from '../backend/entities';
 import { CODE_FILE, importSpecifiers, isLucideExport, resolveImport } from './stream-fixer';
 
 /**
@@ -7,6 +9,8 @@ import { CODE_FILE, importSpecifiers, isLucideExport, resolveImport } from './st
  * log line.
  *
  *   secrets       a key in app code ships to every visitor — the turn stops
+ *   data-model    entity files are valid, and the typed client Forge generates
+ *                 from them is up to date
  *   packages      every imported package exists on npm; a made-up one is
  *                 corrected when the fix is certain, never installed
  *   package-json  real packages the code imports are declared
@@ -17,7 +21,7 @@ import { CODE_FILE, importSpecifiers, isLucideExport, resolveImport } from './st
  * COLLECT; parseTypeErrors() reads its output.
  */
 
-export type GateName = 'stream-fix' | 'secrets' | 'packages' | 'package-json' | 'imports' | 'providers' | 'typecheck';
+export type GateName = 'stream-fix' | 'secrets' | 'data-model' | 'packages' | 'package-json' | 'imports' | 'providers' | 'typecheck';
 
 export interface GateResult {
   gate: GateName;
@@ -172,7 +176,6 @@ export async function validateProject(input: {
   const changed = new Map<string, string>();
   const content = (p: string) => changed.get(p) ?? current.get(p) ?? '';
   const paths = new Set(current.keys());
-  const code = [...paths].filter((p) => p.startsWith('src/') && CODE_FILE.test(p)).sort();
   const issues: Issue[] = [];
 
   // secrets — only what this turn wrote; older files were checked when written
