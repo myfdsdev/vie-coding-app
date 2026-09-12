@@ -335,6 +335,13 @@ export class DockerSandboxProvider implements SandboxProvider {
     return this.createWithFiles(opts, []);
   }
 
+  /** Container and volume, gone: called when the user deletes the project. */
+  async remove(projectId: string): Promise<void> {
+    await this.ensureEngine();
+    await this.docker.getContainer(containerName(projectId)).remove({ force: true, v: false }).catch(ignoreNotFound);
+    await this.docker.getVolume(volumeName(projectId)).remove().catch(ignoreNotFound);
+  }
+
   async resume(projectId: string): Promise<Sandbox | null> {
     await this.ensureEngine();
     const container = this.docker.getContainer(containerName(projectId));

@@ -69,8 +69,7 @@ export async function waitForReady(sandbox: Sandbox, timeoutMs = 60_000): Promis
  */
 export async function destroySandbox(projectId: string): Promise<void> {
   try {
-    const existing = await getSandboxProvider().resume(projectId);
-    await existing?.destroy();
+    await getSandboxProvider().remove(projectId);
   } catch (err) {
     console.error(`[forge] could not remove the sandbox for ${projectId}`, err);
   }

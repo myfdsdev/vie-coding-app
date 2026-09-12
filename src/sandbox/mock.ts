@@ -70,4 +70,9 @@ export class MockSandboxProvider implements SandboxProvider {
   async resume(projectId: string): Promise<Sandbox | null> {
     return this.sandboxes.get(projectId) ?? null;
   }
+
+  async remove(projectId: string): Promise<void> {
+    await this.sandboxes.get(projectId)?.destroy();
+    this.sandboxes.delete(projectId);
+  }
 }

@@ -7,6 +7,11 @@
 export interface SandboxProvider {
   create(opts: { projectId: string; timeoutMs: number }): Promise<Sandbox>;
   resume(projectId: string): Promise<Sandbox | null>;
+  /**
+   * Remove everything a project's sandbox left behind, whether or not it is
+   * running — a stopped container still holds the volume with its code.
+   */
+  remove(projectId: string): Promise<void>;
 }
 
 export type SandboxStatus = 'starting' | 'ready' | 'crashed' | 'stopped';
