@@ -30,6 +30,7 @@ function FileLine({ file }: { file: FileRow }) {
 const GATE_LABEL: Record<CheckRow['gate'], string> = {
   'stream-fix': 'Known AI mistakes',
   secrets: 'No keys in app code',
+  'data-model': 'Stored data',
   packages: 'Packages are real',
   'package-json': 'Dependencies listed',
   imports: 'Imports resolve',
